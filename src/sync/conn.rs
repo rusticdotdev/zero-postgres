@@ -939,11 +939,13 @@ impl Conn {
     /// ## User propagates the error
     ///
     /// ```
-    /// conn.transaction(|conn| {
+    /// # fn example(conn: &mut zero_postgres::sync::Conn) -> zero_postgres::Result<()> {
+    /// conn.transaction(|conn, _tx| {
     ///     conn.query_drop("INSERT ...")?;
     ///     conn.query_drop("INSERT ...")?;
     ///     Ok(())
     /// })
+    /// # }
     /// ```
     ///
     /// When a SQL statement fails, the closure returns the error, and the transaction is rolled back.
@@ -951,12 +953,14 @@ impl Conn {
     /// ## User ignores the last error
     ///
     /// ```
-    /// conn.transaction(|conn| {
+    /// # fn example(conn: &mut zero_postgres::sync::Conn) -> zero_postgres::Result<()> {
+    /// conn.transaction(|conn, _tx| {
     ///     if let Err(e) = conn.query_drop("some risky query ...") {
     ///         log::error!("{}", e);
     ///     }
     ///     Ok(())
     /// })
+    /// # }
     /// ```
     ///
     /// The execution failure will be ignored, the closure returns Ok, the library sends 'COMMIT'.
@@ -965,13 +969,15 @@ impl Conn {
     /// ## User ignores the error and continue
     ///
     /// ```
-    /// conn.transaction(|conn| {
+    /// # fn example(conn: &mut zero_postgres::sync::Conn) -> zero_postgres::Result<()> {
+    /// conn.transaction(|conn, _tx| {
     ///     if let Err(e) = conn.query_drop("some risky query ...") {
-    ///         log::error!(e);
+    ///         log::error!("{}", e);
     ///     }
     ///     conn.query_drop("another query")?; // error
     ///     Ok(())
     /// })
+    /// # }
     /// ```
     ///
     /// This is a bad code.
