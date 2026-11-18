@@ -2,9 +2,9 @@
 
 A high-performance PostgreSQL client library for Rust.
 
-[API Reference (docs.rs)](https://docs.rs/zero-postgres) | [User Guide](https://elbaro.github.io/zero-postgres/) | [Wire Protocol](https://htmlpreview.github.io/?https://github.com/elbaro/zero-postgres/blob/main/wire-protocol.html)
+[API Reference (docs.rs)](https://docs.rs/zero-postgres) | [User Guide](https://rusticdotdev.github.io/zero-postgres/) | [Wire Protocol](https://htmlpreview.github.io/?https://github.com/rusticdotdev/zero-postgres/blob/main/wire-protocol.html)
 
-Python binding: [pyro-postgres](https://github.com/elbaro/pyro-postgres/).
+Python binding: [pyro-postgres](https://github.com/rusticdotdev/pyro-postgres/).
 
 
 ## Feature Flags
@@ -22,7 +22,7 @@ TLS flags use `rustls` with the platform certificate verifier.
 To trust a private CA or present a client certificate, set `Opts::tls_config`
 to a `rustls::ClientConfig` built with the re-exported `zero_postgres::rustls`.
 
-[External type supports](https://elbaro.github.io/zero-postgres/datatype.html#feature-gated-types):
+[External type supports](https://rusticdotdev.github.io/zero-postgres/datatype.html#feature-gated-types):
 - `with-chrono` - Support [chrono](https://crates.io/crates/chrono) date/time types
 - `with-time` - Support [time](https://crates.io/crates/time) date/time types
 - `with-uuid` - Support [uuid](https://crates.io/crates/uuid) types
