@@ -5,8 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ## [v0.9.0](https://github.com/elbaro/zero-postgres/compare/v0.8.0...v0.9.0) - 2026-03-02
 
 ### <!-- 0 -->New features
@@ -74,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### <!-- 9 -->Other
 - [**breaking**] tidy!: rename conn.tx to conn.transaction
-- [**breaking**] tidy!: rename TextHandler, BinaryHandler to SimpleHandler, ExtendedHander
+- [**breaking**] tidy!: rename TextHandler, BinaryHandler to SimpleHandler, ExtendedHandler
 
 ## [v0.6.0](https://github.com/elbaro/zero-postgres/compare/v0.5.0...v0.6.0) - 2026-01-10
 
@@ -99,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - clarify TLS support is experimental
 
 ### <!-- 9 -->Other
-- tidy: remove unncessary pipeline's own buffer
+- tidy: remove unnecessary pipeline's own buffer
 
 ## [v0.4.3](https://github.com/elbaro/zero-postgres/compare/v0.4.2...v0.4.3) - 2025-12-29
 
@@ -136,7 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - use postgres 18
-- change relase PR title
+- change release PR title
 - trusted publishing
 - setup release-plz
 - release-plz

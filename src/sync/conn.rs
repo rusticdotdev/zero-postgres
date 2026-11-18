@@ -953,7 +953,7 @@ impl Conn {
     /// ```
     /// conn.transaction(|conn| {
     ///     if let Err(e) = conn.query_drop("some risky query ...") {
-    ///         log::error!(e);
+    ///         log::error!("{}", e);
     ///     }
     ///     Ok(())
     /// })
