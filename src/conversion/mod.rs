@@ -12,10 +12,10 @@ mod string;
 
 pub use numeric_util::numeric_to_string;
 
-#[cfg(feature = "with-chrono")]
-mod chrono;
 #[cfg(feature = "with-rust-decimal")]
 mod decimal;
+#[cfg(feature = "with-jiff")]
+mod jiff;
 #[cfg(feature = "with-time")]
 mod time;
 #[cfg(feature = "with-uuid")]

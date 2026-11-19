@@ -23,7 +23,7 @@ To trust a private CA or present a client certificate, set `Opts::tls_config`
 to a `rustls::ClientConfig` built with the re-exported `zero_postgres::rustls`.
 
 [External type supports](https://rusticdotdev.github.io/zero-postgres/datatype.html#feature-gated-types):
-- `with-chrono` - Support [chrono](https://crates.io/crates/chrono) date/time types
+- `with-jiff` - Support [jiff](https://crates.io/crates/jiff) date/time types
 - `with-time` - Support [time](https://crates.io/crates/time) date/time types
 - `with-uuid` - Support [uuid](https://crates.io/crates/uuid) types
 - `with-rust-decimal` - Support [rust_decimal](https://crates.io/crates/rust_decimal) types

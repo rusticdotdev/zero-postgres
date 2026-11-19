@@ -46,21 +46,21 @@ PostgreSQL only has signed integer types. Decoding to unsigned Rust types (`u8`,
 
 Additional type support is available through feature flags.
 
-### `with-chrono` (chrono crate)
+### `with-jiff` (jiff crate)
 
 | Rust Type | PostgreSQL Type |
 |-----------|-----------------|
-| `chrono::NaiveDate` | `DATE` |
-| `chrono::NaiveTime` | `TIME` |
-| `chrono::NaiveDateTime` | `TIMESTAMP`, `TIMESTAMPTZ` |
-| `chrono::DateTime<Utc>` | `TIMESTAMPTZ` |
+| `jiff::civil::Date` | `DATE` |
+| `jiff::civil::Time` | `TIME` |
+| `jiff::civil::DateTime` | `TIMESTAMP`, `TIMESTAMPTZ` |
+| `jiff::Timestamp` | `TIMESTAMPTZ` |
 
 | PostgreSQL Type | Rust Types |
 |-----------------|------------|
-| `DATE` | `chrono::NaiveDate` |
-| `TIME` | `chrono::NaiveTime` |
-| `TIMESTAMP` | `chrono::NaiveDateTime` |
-| `TIMESTAMPTZ` | `chrono::NaiveDateTime`, `chrono::DateTime<Utc>` |
+| `DATE` | `jiff::civil::Date` |
+| `TIME` | `jiff::civil::Time` |
+| `TIMESTAMP` | `jiff::civil::DateTime` |
+| `TIMESTAMPTZ` | `jiff::civil::DateTime`, `jiff::Timestamp` |
 
 ### `with-time` (time crate)
 
