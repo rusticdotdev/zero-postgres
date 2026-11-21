@@ -4,20 +4,23 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    types: [edited]
 
-permissions:
-  id-token: write
-  contents: write
-  pull-requests: write
-
-concurrency:
-  group: release-plz-${{ github.ref }}
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
   release-plz:
     name: Release-plz
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -27,6 +30,39 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz
-        uses: release-plz/action@v0.5
+        uses: rusticdotdev/release-plz/.github/actions/release-plz@ead71e9db8ee02b8cb31fedc47663a2578409daf # main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # When the description of the release PR is edited, copy the text between the
+  # `<!-- release-plz:changelog-start ... -->` and `<!-- release-plz:changelog-end -->`
+  # comments into CHANGELOG.md on the release PR branch.
+  sync-changelog:
+    name: Sync changelog
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.changes.body &&
+      startsWith(github.head_ref, 'release-plz-') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    concurrency:
+      group: sync-changelog-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout release PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz sync-changelog
+        uses: rusticdotdev/release-plz/.github/actions/release-plz@ead71e9db8ee02b8cb31fedc47663a2578409daf # main
+        with:
+          command: sync-changelog
+          pr: ${{ github.event.pull_request.number }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
