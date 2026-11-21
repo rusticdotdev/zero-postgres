@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.10.0](https://github.com/rusticdotdev/zero-postgres/compare/v0.9.0...v0.10.0) - 2026-11-21
+
+### <!-- 0 -->Breaking Changes
+- [**breaking**] the `with-chrono` feature is replaced with `with-jiff`
+- [**breaking**] rename `SslMode` to `TlsMode`, and the `sslmode` URL parameter to `tls_mode`
+- [**breaking**] `native-tls` is replaceed  with `rustls` and `rustls-platform-verifier`
+
+### New Features
+- add `Opts::tls_config` for a custom `rustls` config
+
+### <!-- 1 -->Bug fixes
+- release the sync pool permit when connecting fails
+- make async pools safe to drop without a runtime and limit compio
+- percent-decode the user, password and database in connection URLs
+- stop capping tracing levels in applications that depend on the crate
+- return a decode error for time::Date out of range such as infinity
+- prefix the version byte when encoding strings as JSONB
+- map Diesel exclusion, restrict and read-only SQLSTATEs to their error kinds
+- hold the tokio pool permit until the connection reset finishes
+- report rows affected for MERGE
+
 ## [v0.9.0](https://github.com/elbaro/zero-postgres/compare/v0.8.0...v0.9.0) - 2026-03-02
 
 ### <!-- 0 -->New features
