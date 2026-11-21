@@ -2,7 +2,7 @@
 dependencies_update = false
 pr_name = "release{% if package and version %}: {{ package }} v{{ version }}{% endif %}"
 pr_labels = ["release"]
-release_commits = "^(feat|fix|refactor|perf|deps|revert)[(!:]"
+release_commits = "^(feat|fix|refactor|perf|deps|infra|revert)[(!:]"
 pr_body = """
 {% set changes %}
 {%- for release in releases %}
@@ -46,7 +46,7 @@ header = """# Changelog
 """
 commit_parsers = [
   { message = "^release", skip = true },
-  { message = "^infra", skip = true },
+  { message = "^infra", group = "<!-- hidden -->" },
   { message = "^deps", group = "<!-- hidden -->" },
   { message = "^feat", group = "<!-- 0 -->New features" },
   { message = "^fix", group = "<!-- 1 -->Bug fixes" },
