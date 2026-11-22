@@ -370,18 +370,14 @@ impl Conn {
 
     /// Execute a simple query with a handler.
     pub async fn query<H: SimpleHandler>(&mut self, sql: &str, handler: &mut H) -> Result<()> {
-        let result = self.query_inner(sql, handler).await;
+        let mut state_machine = SimpleQueryStateMachine::new(handler, sql);
+        let result = self.drive(&mut state_machine).await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
             self.is_broken = true;
         }
         result
-    }
-
-    async fn query_inner<H: SimpleHandler>(&mut self, sql: &str, handler: &mut H) -> Result<()> {
-        let mut state_machine = SimpleQueryStateMachine::new(handler, sql);
-        self.drive(&mut state_machine).await
     }
 
     /// Execute a simple query and discard results.

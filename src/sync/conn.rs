@@ -372,18 +372,14 @@ impl Conn {
 
     /// Execute a simple query with a handler.
     pub fn query<H: SimpleHandler>(&mut self, sql: &str, handler: &mut H) -> Result<()> {
-        let result = self.query_inner(sql, handler);
+        let mut state_machine = SimpleQueryStateMachine::new(handler, sql);
+        let result = self.drive(&mut state_machine);
         if let Err(e) = &result
             && e.is_connection_broken()
         {
             self.is_broken = true;
         }
         result
-    }
-
-    fn query_inner<H: SimpleHandler>(&mut self, sql: &str, handler: &mut H) -> Result<()> {
-        let mut state_machine = SimpleQueryStateMachine::new(handler, sql);
-        self.drive(&mut state_machine)
     }
 
     /// Execute a simple query and discard results.
