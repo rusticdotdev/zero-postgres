@@ -89,6 +89,13 @@ impl<'a> Pipeline<'a> {
         }
     }
 
+    /// Marks the connection broken if a queued request has not had its response read.
+    pub(crate) fn mark_broken_if_responses_pending(&mut self) {
+        if !self.expectations.is_empty() {
+            self.conn.is_broken = true;
+        }
+    }
+
     /// Cleanup the pipeline, draining any unclaimed tickets.
     ///
     /// This is called automatically by [`Conn::pipeline`].
@@ -230,12 +237,12 @@ impl<'a> Pipeline<'a> {
     pub async fn flush(&mut self) -> Result<()> {
         if !self.conn.buffer_set.write_buffer.is_empty() {
             write_flush(&mut self.conn.buffer_set.write_buffer);
-            self.conn
-                .stream
-                .write_all(&self.conn.buffer_set.write_buffer)
-                .await?;
-            self.conn.stream.flush().await?;
-            self.conn.buffer_set.write_buffer.clear();
+            let mut guard = std::mem::DropGuard::new(&mut *self.conn, |conn| conn.is_broken = true);
+            let conn: &mut Conn = &mut guard;
+            conn.stream.write_all(&conn.buffer_set.write_buffer).await?;
+            conn.stream.flush().await?;
+            conn.buffer_set.write_buffer.clear();
+            std::mem::DropGuard::dismiss(guard);
         }
         Ok(())
     }
@@ -257,22 +264,22 @@ impl<'a> Pipeline<'a> {
     async fn sync_inner(&mut self) -> Result<()> {
         write_sync(&mut self.conn.buffer_set.write_buffer);
         self.expectations.push_back(Expectation::Sync);
-        self.conn
-            .stream
-            .write_all(&self.conn.buffer_set.write_buffer)
-            .await?;
-        self.conn.stream.flush().await?;
-        self.conn.buffer_set.write_buffer.clear();
+        let mut guard = std::mem::DropGuard::new(&mut *self.conn, |conn| conn.is_broken = true);
+        let conn: &mut Conn = &mut guard;
+        conn.stream.write_all(&conn.buffer_set.write_buffer).await?;
+        conn.stream.flush().await?;
+        conn.buffer_set.write_buffer.clear();
+        std::mem::DropGuard::dismiss(guard);
         Ok(())
     }
 
     /// Consume a single ReadyForQuery message.
     async fn consume_ready_for_query(&mut self) -> Result<()> {
         loop {
-            self.conn
-                .stream
-                .read_message(&mut self.conn.buffer_set)
-                .await?;
+            let mut guard = std::mem::DropGuard::new(&mut *self.conn, |conn| conn.is_broken = true);
+            let conn: &mut Conn = &mut guard;
+            conn.stream.read_message(&mut conn.buffer_set).await?;
+            std::mem::DropGuard::dismiss(guard);
             let type_byte = self.conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
@@ -550,10 +557,10 @@ impl<'a> Pipeline<'a> {
     /// Read the next message, skipping async messages and handling errors.
     async fn read_next_message(&mut self) -> Result<()> {
         loop {
-            self.conn
-                .stream
-                .read_message(&mut self.conn.buffer_set)
-                .await?;
+            let mut guard = std::mem::DropGuard::new(&mut *self.conn, |conn| conn.is_broken = true);
+            let conn: &mut Conn = &mut guard;
+            conn.stream.read_message(&mut conn.buffer_set).await?;
+            std::mem::DropGuard::dismiss(guard);
             let type_byte = self.conn.buffer_set.type_byte;
 
             // Handle async messages

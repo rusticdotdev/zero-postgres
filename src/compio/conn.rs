@@ -264,27 +264,32 @@ impl Conn {
         };
 
         // Drive the state machine to completion (ParseComplete + BindComplete)
+        let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
+        let conn: &mut Self = &mut guard;
         loop {
-            match state_machine.step(&mut self.buffer_set)? {
+            match state_machine.step(&mut conn.buffer_set)? {
                 Action::ReadMessage => {
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Action::Write => {
-                    let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-                    let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-                    self.buffer_set.write_buffer = buf;
+                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                    conn.buffer_set.write_buffer = buf;
                     result?;
-                    self.stream.flush().await?;
+                    conn.stream.flush().await?;
                 }
                 Action::WriteAndReadMessage => {
-                    let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-                    let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-                    self.buffer_set.write_buffer = buf;
+                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                    conn.buffer_set.write_buffer = buf;
                     result?;
-                    self.stream.flush().await?;
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.flush().await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
-                Action::Finished => break,
+                Action::Finished => {
+                    std::mem::DropGuard::dismiss(guard);
+                    break;
+                }
                 _ => return Err(Error::LibraryBug("Unexpected action in bind".into())),
             }
         }
@@ -318,30 +323,32 @@ impl Conn {
 
     /// Drive a state machine to completion.
     async fn drive<S: StateMachine>(&mut self, state_machine: &mut S) -> Result<()> {
+        let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
+        let conn: &mut Self = &mut guard;
         loop {
-            match state_machine.step(&mut self.buffer_set)? {
+            match state_machine.step(&mut conn.buffer_set)? {
                 Action::WriteAndReadByte => {
                     return Err(Error::LibraryBug(
                         "Unexpected WriteAndReadByte in query state machine".into(),
                     ));
                 }
                 Action::ReadMessage => {
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Action::Write => {
-                    let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-                    let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-                    self.buffer_set.write_buffer = buf;
+                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                    conn.buffer_set.write_buffer = buf;
                     result?;
-                    self.stream.flush().await?;
+                    conn.stream.flush().await?;
                 }
                 Action::WriteAndReadMessage => {
-                    let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-                    let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-                    self.buffer_set.write_buffer = buf;
+                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                    conn.buffer_set.write_buffer = buf;
                     result?;
-                    self.stream.flush().await?;
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.flush().await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Action::TlsHandshake => {
                     return Err(Error::LibraryBug(
@@ -349,18 +356,20 @@ impl Conn {
                     ));
                 }
                 Action::HandleAsyncMessageAndReadMessage(async_msg) => {
-                    if let Some(h) = &mut self.async_message_handler {
+                    if let Some(h) = &mut conn.async_message_handler {
                         h(&async_msg);
                     }
                     // Read next message after handling async message
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Action::Error(server_error) => {
-                    self.transaction_status = state_machine.transaction_status();
+                    conn.transaction_status = state_machine.transaction_status();
+                    std::mem::DropGuard::dismiss(guard);
                     return Err(Error::Server(server_error));
                 }
                 Action::Finished => {
-                    self.transaction_status = state_machine.transaction_status();
+                    conn.transaction_status = state_machine.transaction_status();
+                    std::mem::DropGuard::dismiss(guard);
                     break;
                 }
             }
@@ -485,21 +494,24 @@ impl Conn {
         let mut state_machine =
             BatchPrepareStateMachine::new(&mut self.buffer_set, queries, start_idx);
 
+        let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
+        let conn: &mut Self = &mut guard;
         loop {
-            match state_machine.step(&mut self.buffer_set)? {
+            match state_machine.step(&mut conn.buffer_set)? {
                 Action::ReadMessage => {
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Action::WriteAndReadMessage => {
-                    let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-                    let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-                    self.buffer_set.write_buffer = buf;
+                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                    conn.buffer_set.write_buffer = buf;
                     result?;
-                    self.stream.flush().await?;
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.flush().await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Action::Finished => {
-                    self.transaction_status = state_machine.transaction_status();
+                    conn.transaction_status = state_machine.transaction_status();
+                    std::mem::DropGuard::dismiss(guard);
                     break;
                 }
                 _ => {
@@ -722,25 +734,29 @@ impl Conn {
     ) -> Result<()> {
         use crate::state::action::Action;
 
+        let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
+        let conn: &mut Self = &mut guard;
         loop {
-            let step_result = state_machine.step(&mut self.buffer_set);
+            let step_result = state_machine.step(&mut conn.buffer_set);
             match step_result {
                 Ok(Action::ReadMessage) => {
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Ok(Action::WriteAndReadMessage) => {
-                    let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-                    let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-                    self.buffer_set.write_buffer = buf;
+                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                    conn.buffer_set.write_buffer = buf;
                     result?;
-                    self.stream.flush().await?;
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.flush().await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Ok(Action::Finished) => {
+                    std::mem::DropGuard::dismiss(guard);
                     break;
                 }
                 Ok(Action::Error(server_error)) => {
-                    self.transaction_status = state_machine.transaction_status();
+                    conn.transaction_status = state_machine.transaction_status();
+                    std::mem::DropGuard::dismiss(guard);
                     return Err(Error::Server(server_error));
                 }
                 Ok(_) => return Err(Error::LibraryBug("Unexpected action in batch".into())),
@@ -803,17 +819,19 @@ impl Conn {
         self.buffer_set.write_buffer.clear();
         write_sync(&mut self.buffer_set.write_buffer);
 
-        let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-        let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-        self.buffer_set.write_buffer = buf;
+        let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
+        let conn: &mut Self = &mut guard;
+        let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+        let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+        conn.buffer_set.write_buffer = buf;
         result?;
-        self.stream.flush().await?;
+        conn.stream.flush().await?;
 
         let mut pending_error: Option<Error> = None;
 
         loop {
-            self.stream.read_message(&mut self.buffer_set).await?;
-            let type_byte = self.buffer_set.type_byte;
+            conn.stream.read_message(&mut conn.buffer_set).await?;
+            let type_byte = conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
                 continue;
@@ -821,15 +839,16 @@ impl Conn {
 
             match type_byte {
                 msg_type::READY_FOR_QUERY => {
-                    let ready = ReadyForQuery::parse(&self.buffer_set.read_buffer)?;
-                    self.transaction_status = ready.transaction_status().unwrap_or_default();
+                    let ready = ReadyForQuery::parse(&conn.buffer_set.read_buffer)?;
+                    conn.transaction_status = ready.transaction_status().unwrap_or_default();
+                    std::mem::DropGuard::dismiss(guard);
                     if let Some(e) = pending_error {
                         return Err(e);
                     }
                     return Ok(());
                 }
                 msg_type::ERROR_RESPONSE => {
-                    let error = ErrorResponse::parse(&self.buffer_set.read_buffer)?;
+                    let error = ErrorResponse::parse(&conn.buffer_set.read_buffer)?;
                     pending_error = Some(error.into_error());
                 }
                 _ => {
@@ -941,17 +960,19 @@ impl Conn {
         write_execute(&mut self.buffer_set.write_buffer, portal, max_rows);
         write_flush(&mut self.buffer_set.write_buffer);
 
-        let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-        let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-        self.buffer_set.write_buffer = buf;
+        let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
+        let conn: &mut Self = &mut guard;
+        let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+        let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+        conn.buffer_set.write_buffer = buf;
         result?;
-        self.stream.flush().await?;
+        conn.stream.flush().await?;
 
         let mut column_buffer: Vec<u8> = Vec::new();
 
         loop {
-            self.stream.read_message(&mut self.buffer_set).await?;
-            let type_byte = self.buffer_set.type_byte;
+            conn.stream.read_message(&mut conn.buffer_set).await?;
+            let type_byte = conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
                 continue;
@@ -960,30 +981,35 @@ impl Conn {
             match type_byte {
                 msg_type::ROW_DESCRIPTION => {
                     column_buffer.clear();
-                    column_buffer.extend_from_slice(&self.buffer_set.read_buffer);
+                    column_buffer.extend_from_slice(&conn.buffer_set.read_buffer);
                     let cols = RowDescription::parse(&column_buffer)?;
                     handler.result_start(cols)?;
                 }
                 msg_type::NO_DATA => {
-                    NoData::parse(&self.buffer_set.read_buffer)?;
+                    NoData::parse(&conn.buffer_set.read_buffer)?;
                 }
                 msg_type::DATA_ROW => {
                     let cols = RowDescription::parse(&column_buffer)?;
-                    let row = DataRow::parse(&self.buffer_set.read_buffer)?;
+                    let row = DataRow::parse(&conn.buffer_set.read_buffer)?;
                     handler.row(cols, row)?;
                 }
                 msg_type::COMMAND_COMPLETE => {
-                    let complete = CommandComplete::parse(&self.buffer_set.read_buffer)?;
+                    let complete = CommandComplete::parse(&conn.buffer_set.read_buffer)?;
                     handler.result_end(complete)?;
+                    std::mem::DropGuard::dismiss(guard);
                     return Ok(false); // No more rows
                 }
                 msg_type::PORTAL_SUSPENDED => {
-                    PortalSuspended::parse(&self.buffer_set.read_buffer)?;
+                    PortalSuspended::parse(&conn.buffer_set.read_buffer)?;
+                    std::mem::DropGuard::dismiss(guard);
                     return Ok(true); // More rows available
                 }
                 msg_type::ERROR_RESPONSE => {
-                    let error = ErrorResponse::parse(&self.buffer_set.read_buffer)?;
-                    return Err(error.into_error());
+                    let error = ErrorResponse::parse(&conn.buffer_set.read_buffer)?.into_error();
+                    if !error.is_connection_broken() {
+                        std::mem::DropGuard::dismiss(guard);
+                    }
+                    return Err(error);
                 }
                 _ => {
                     return Err(Error::LibraryBug(format!(
@@ -1040,25 +1066,27 @@ impl Conn {
         };
 
         // Drive the state machine to completion (ParseComplete + BindComplete)
+        let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
+        let conn: &mut Self = &mut guard;
         loop {
-            match state_machine.step(&mut self.buffer_set)? {
+            match state_machine.step(&mut conn.buffer_set)? {
                 Action::ReadMessage => {
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Action::Write => {
-                    let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-                    let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-                    self.buffer_set.write_buffer = buf;
+                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                    conn.buffer_set.write_buffer = buf;
                     result?;
-                    self.stream.flush().await?;
+                    conn.stream.flush().await?;
                 }
                 Action::WriteAndReadMessage => {
-                    let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-                    let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-                    self.buffer_set.write_buffer = buf;
+                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                    conn.buffer_set.write_buffer = buf;
                     result?;
-                    self.stream.flush().await?;
-                    self.stream.read_message(&mut self.buffer_set).await?;
+                    conn.stream.flush().await?;
+                    conn.stream.read_message(&mut conn.buffer_set).await?;
                 }
                 Action::Finished => break,
                 _ => return Err(Error::LibraryBug("Unexpected action in bind".into())),
@@ -1066,11 +1094,12 @@ impl Conn {
         }
 
         // Execute closure with portal handle
-        let mut portal = super::unnamed_portal::UnnamedPortal { conn: self };
+        let mut portal = super::unnamed_portal::UnnamedPortal { conn };
         let result = f(&mut portal).await;
 
         // Always sync to end implicit transaction (even on error)
         let sync_result = portal.conn.sync_inner().await;
+        std::mem::DropGuard::dismiss(guard);
 
         // Return closure result, or sync error if closure succeeded but sync failed
         match (result, sync_result) {
@@ -1099,15 +1128,17 @@ impl Conn {
         write_close_portal(&mut self.buffer_set.write_buffer, portal);
         write_flush(&mut self.buffer_set.write_buffer);
 
-        let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-        let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-        self.buffer_set.write_buffer = buf;
+        let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
+        let conn: &mut Self = &mut guard;
+        let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+        let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+        conn.buffer_set.write_buffer = buf;
         result?;
-        self.stream.flush().await?;
+        conn.stream.flush().await?;
 
         loop {
-            self.stream.read_message(&mut self.buffer_set).await?;
-            let type_byte = self.buffer_set.type_byte;
+            conn.stream.read_message(&mut conn.buffer_set).await?;
+            let type_byte = conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
                 continue;
@@ -1115,12 +1146,16 @@ impl Conn {
 
             match type_byte {
                 msg_type::CLOSE_COMPLETE => {
-                    CloseComplete::parse(&self.buffer_set.read_buffer)?;
+                    CloseComplete::parse(&conn.buffer_set.read_buffer)?;
+                    std::mem::DropGuard::dismiss(guard);
                     return Ok(());
                 }
                 msg_type::ERROR_RESPONSE => {
-                    let error = ErrorResponse::parse(&self.buffer_set.read_buffer)?;
-                    return Err(error.into_error());
+                    let error = ErrorResponse::parse(&conn.buffer_set.read_buffer)?.into_error();
+                    if !error.is_connection_broken() {
+                        std::mem::DropGuard::dismiss(guard);
+                    }
+                    return Err(error);
                 }
                 _ => {
                     return Err(Error::LibraryBug(format!(
@@ -1137,9 +1172,15 @@ impl Conn {
     where
         F: AsyncFnOnce(&mut super::pipeline::Pipeline<'_>) -> Result<T>,
     {
-        let mut pipeline = super::pipeline::Pipeline::new_inner(self);
+        let mut pipeline = std::mem::DropGuard::new(
+            super::pipeline::Pipeline::new_inner(self),
+            |mut pipeline| {
+                pipeline.mark_broken_if_responses_pending();
+            },
+        );
         let result = f(&mut pipeline).await;
         pipeline.cleanup().await;
+        drop(std::mem::DropGuard::dismiss(pipeline));
         result
     }
 
