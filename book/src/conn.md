@@ -66,5 +66,20 @@ let mut conn = Conn::new(opts)?;
 
 ## Authentication Methods
 
-- Supported: `trust`, `reject`, `scram-sha-256`, `md5`, `password`, `ident`, `peer`, `ldap`, `radius`, `pam`, `bsd`, `cert`
-- Todo: `scram-sha-256` with channel binding, `gss`, `sspi`, `oauth`
+- Supported: `trust`, `reject`, `scram-sha-256`, `md5`, `password`, `ident`, `peer`, `ldap`, `radius`, `pam`, `bsd`, `cert`, `oauth`
+- Todo: `scram-sha-256` with channel binding, `gss`, `sspi`
+
+### OAuth
+
+Set `Opts.oauth_bearer_token_fn` to send a bearer token when the server asks for `OAUTHBEARER`.
+The token is sent like a cleartext password, so use `TlsMode::Require`.
+
+When the server rejects the token, it sends a JSON document such as `{"status":"invalid_token","openid-configuration":"...","scope":"..."}` and then fails the connection.
+Set `Opts.oauth_discovery_fn` to receive that JSON.
+
+If only `oauth_discovery_fn` is set, the driver sends an empty `auth` value. The server answers with the same JSON, which tells you where to get a token, and the connection fails.
+
+```rust,ignore
+opts.oauth_bearer_token_fn = Some(Arc::new(|| Ok(current_token().into())));
+opts.oauth_discovery_fn = Some(Arc::new(|error_json| log::warn!("{error_json}")));
+```

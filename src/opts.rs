@@ -61,6 +61,9 @@ pub struct Opts {
     pub oauth_bearer_token_fn:
         Option<Arc<dyn Fn() -> Result<Cow<'static, str>, Error> + Send + Sync>>,
 
+    #[debug("{}", if oauth_discovery_fn.is_some() { "Some(..)" } else { "None" })]
+    pub oauth_discovery_fn: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+
     /// Application name to report to the server.
     ///
     /// Default: `None`
@@ -151,6 +154,7 @@ impl Default for Opts {
             password: None,
             password_fn: None,
             oauth_bearer_token_fn: None,
+            oauth_discovery_fn: None,
             application_name: None,
             tls_mode: TlsMode::Prefer,
             #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
@@ -354,9 +358,29 @@ mod tests {
     }
 
     #[test]
+    fn oauth_discovery_fn_debug_shows_presence_only() {
+        let without_fn = format!("{:?}", Opts::default());
+        assert!(
+            without_fn.contains("oauth_discovery_fn: None"),
+            "{without_fn}"
+        );
+
+        let opts = Opts {
+            oauth_discovery_fn: Some(Arc::new(|_| {})),
+            ..Opts::default()
+        };
+        let with_fn = format!("{opts:?}");
+        assert!(
+            with_fn.contains("oauth_discovery_fn: Some(..)"),
+            "{with_fn}"
+        );
+    }
+
+    #[test]
     fn new_auth_options_default_to_none() {
         let opts = Opts::default();
         assert!(opts.password_fn.is_none());
         assert!(opts.oauth_bearer_token_fn.is_none());
+        assert!(opts.oauth_discovery_fn.is_none());
     }
 }
