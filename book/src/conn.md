@@ -66,5 +66,5 @@ let mut conn = Conn::new(opts)?;
 
 ## Authentication Methods
 
-- Supported: `trust`, `reject`, `scram-sha-256`, `md5`, `password`, `ident`, `peer`, `ldap`, `radius`, `pam`, `bsd`, `cert`
-- Todo: `scram-sha-256` with channel binding, `gss`, `sspi`, `oauth`
+- Supported: `trust`, `reject`, `scram-sha-256`, `md5`, `password`, `ident`, `peer`, `ldap`, `radius`, `pam`, `bsd`, `cert`, `oauth`
+- Todo: `scram-sha-256` with channel binding, `gss`, `sspi`

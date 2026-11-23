@@ -29,6 +29,10 @@ enum State {
     WaitingAuth,
     SaslInProgressRead,
     SaslInProgress,
+    OauthInProgressRead,
+    OauthInProgress,
+    OauthFailedRead,
+    OauthFailed,
     WaitingAuthResultRead,
     WaitingAuthResult,
     WaitingReady,
@@ -220,6 +224,31 @@ impl ConnectionStateMachine {
                 Ok(Action::Write)
             }
             AuthenticationMessage::Sasl { mechanisms } => {
+                if mechanisms.contains(&"OAUTHBEARER") {
+                    let initial_response = match &self.options.oauth_bearer_token_fn {
+                        Some(oauth_bearer_token_fn) => {
+                            format!("n,,\x01auth=Bearer {}\x01\x01", oauth_bearer_token_fn()?)
+                        }
+                        None if self.options.oauth_discovery_fn.is_some() => {
+                            "n,,\x01auth=\x01\x01".to_string()
+                        }
+                        None => {
+                            return Err(Error::Auth(
+                                "OAuth bearer token required but not provided".into(),
+                            ));
+                        }
+                    };
+
+                    buffer_set.write_buffer.clear();
+                    write_sasl_initial_response(
+                        &mut buffer_set.write_buffer,
+                        "OAUTHBEARER",
+                        initial_response.as_bytes(),
+                    );
+                    self.state = State::OauthInProgressRead;
+                    return Ok(Action::Write);
+                }
+
                 // Check if SCRAM-SHA-256 is supported
                 if !mechanisms.contains(&"SCRAM-SHA-256") {
                     return Err(Error::Auth(format!(
@@ -246,6 +275,42 @@ impl ConnectionStateMachine {
             }
             _ => Err(Error::Unsupported(format!(
                 "Unsupported authentication method: {:?}",
+                auth
+            ))),
+        }
+    }
+
+    fn handle_oauth_message(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
+        let type_byte = buffer_set.type_byte;
+        if type_byte != msg_type::AUTHENTICATION {
+            return Err(Error::LibraryBug(format!(
+                "Expected Authentication message, got '{}'",
+                type_byte as char
+            )));
+        }
+
+        let auth = AuthenticationMessage::parse(&buffer_set.read_buffer)?;
+
+        match auth {
+            AuthenticationMessage::Ok => {
+                self.state = State::WaitingReady;
+                Ok(Action::ReadMessage)
+            }
+            AuthenticationMessage::SaslContinue { data } => {
+                let error_json = simdutf8::compat::from_utf8(data)
+                    .map_err(|e| Error::Auth(format!("Invalid OAUTHBEARER error: {}", e)))?;
+
+                if let Some(oauth_discovery_fn) = &self.options.oauth_discovery_fn {
+                    oauth_discovery_fn(error_json);
+                }
+
+                buffer_set.write_buffer.clear();
+                write_sasl_response(&mut buffer_set.write_buffer, b"\x01");
+                self.state = State::OauthFailedRead;
+                Ok(Action::Write)
+            }
+            _ => Err(Error::Auth(format!(
+                "Unexpected OAUTHBEARER message: {:?}",
                 auth
             ))),
         }
@@ -404,6 +469,14 @@ impl StateMachine for ConnectionStateMachine {
                 self.state = State::SaslInProgress;
                 return Ok(Action::ReadMessage);
             }
+            State::OauthInProgressRead => {
+                self.state = State::OauthInProgress;
+                return Ok(Action::ReadMessage);
+            }
+            State::OauthFailedRead => {
+                self.state = State::OauthFailed;
+                return Ok(Action::ReadMessage);
+            }
             State::WaitingAuthResultRead => {
                 self.state = State::WaitingAuthResult;
                 return Ok(Action::ReadMessage);
@@ -431,6 +504,11 @@ impl StateMachine for ConnectionStateMachine {
         match self.state {
             State::WaitingAuth => self.handle_auth_message(buffer_set),
             State::SaslInProgress => self.handle_sasl_message(buffer_set),
+            State::OauthInProgress => self.handle_oauth_message(buffer_set),
+            State::OauthFailed => Err(Error::Auth(format!(
+                "Expected ErrorResponse after OAUTHBEARER failure, got '{}'",
+                type_byte as char
+            ))),
             State::WaitingAuthResult => self.handle_auth_result(buffer_set),
             State::WaitingReady => self.handle_ready_message(buffer_set),
             _ => Err(Error::LibraryBug(format!(
@@ -798,5 +876,396 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    fn oauth_initial_response_message(token: &str) -> Vec<u8> {
+        oauth_message_with_auth(&format!("Bearer {token}"))
+    }
+
+    fn oauth_message_with_auth(auth: &str) -> Vec<u8> {
+        let initial_response = format!("n,,\x01auth={auth}\x01\x01");
+        let mut body = b"OAUTHBEARER\0".to_vec();
+        body.extend_from_slice(&(initial_response.len() as i32).to_be_bytes());
+        body.extend_from_slice(initial_response.as_bytes());
+        password_message(&body)
+    }
+
+    fn error_response_payload(code: &str, message: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for (field, value) in [(b'S', "FATAL"), (b'C', code), (b'M', message)] {
+            payload.push(field);
+            payload.extend_from_slice(value.as_bytes());
+            payload.push(0);
+        }
+        payload.push(0);
+        payload
+    }
+
+    fn recording_discovery_fn() -> (
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&calls);
+        let discovery_fn: Arc<dyn Fn(&str) + Send + Sync> =
+            Arc::new(move |json: &str| recorder.lock().unwrap().push(json.to_string()));
+        (calls, discovery_fn)
+    }
+
+    const OAUTH_ERROR_JSON: &str = r#"{"status":"invalid_token","openid-configuration":"https://issuer.example/.well-known/openid-configuration","scope":"openid"}"#;
+
+    fn oauth_rejected_machine(
+        options: Opts,
+        buffer_set: &mut BufferSet,
+        error_json: &[u8],
+    ) -> (ConnectionStateMachine, Result<Action>) {
+        let mut machine = auth_machine(options);
+        feed(
+            &mut machine,
+            buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["OAUTHBEARER"]),
+        )
+        .unwrap();
+        assert!(matches!(machine.step(buffer_set), Ok(Action::ReadMessage)));
+        assert_eq!(machine.state, State::OauthInProgress);
+        let action = feed(
+            &mut machine,
+            buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(11, error_json),
+        );
+        (machine, action)
+    }
+
+    #[test]
+    fn oauth_bearer_token_sent_and_accepted() {
+        let (discovery_calls, discovery_fn) = recording_discovery_fn();
+        let options = Opts {
+            oauth_bearer_token_fn: Some(Arc::new(|| Ok("token-abc.def_ghi".into()))),
+            oauth_discovery_fn: Some(discovery_fn),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        let mut buffer_set = BufferSet::new();
+        let action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["OAUTHBEARER"]),
+        );
+        assert!(matches!(action, Ok(Action::Write)));
+        assert_eq!(
+            buffer_set.write_buffer,
+            oauth_initial_response_message("token-abc.def_ghi")
+        );
+        assert_eq!(machine.state, State::OauthInProgressRead);
+        assert!(machine.scram_client.is_none());
+
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::ReadMessage)
+        ));
+        assert_eq!(machine.state, State::OauthInProgress);
+
+        let ok_action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(0, &[]),
+        );
+        assert!(matches!(ok_action, Ok(Action::ReadMessage)));
+        assert_eq!(machine.state, State::WaitingReady);
+        assert!(discovery_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn oauth_bearer_rejection_calls_discovery_fn_and_fails_on_error_response() {
+        let (discovery_calls, discovery_fn) = recording_discovery_fn();
+        let options = Opts {
+            oauth_bearer_token_fn: Some(Arc::new(|| Ok("expired".into()))),
+            oauth_discovery_fn: Some(discovery_fn),
+            ..Opts::default()
+        };
+        let mut buffer_set = BufferSet::new();
+        let (mut machine, action) =
+            oauth_rejected_machine(options, &mut buffer_set, OAUTH_ERROR_JSON.as_bytes());
+        assert!(matches!(action, Ok(Action::Write)));
+        assert_eq!(buffer_set.write_buffer, password_message(b"\x01"));
+        assert_eq!(machine.state, State::OauthFailedRead);
+        assert_eq!(*discovery_calls.lock().unwrap(), vec![OAUTH_ERROR_JSON]);
+
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::ReadMessage)
+        ));
+        assert_eq!(machine.state, State::OauthFailed);
+
+        let err = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::ERROR_RESPONSE,
+            &error_response_payload("28000", "OAuth bearer authentication failed"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Server(server) if server.code() == "28000"
+                && server.message() == "OAuth bearer authentication failed"),
+            "{err}"
+        );
+        assert_eq!(discovery_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oauth_bearer_rejection_without_discovery_fn() {
+        let options = Opts {
+            oauth_bearer_token_fn: Some(Arc::new(|| Ok("expired".into()))),
+            ..Opts::default()
+        };
+        for error_json in [OAUTH_ERROR_JSON.as_bytes(), b"", b"{}"] {
+            let mut buffer_set = BufferSet::new();
+            let (mut machine, action) =
+                oauth_rejected_machine(options.clone(), &mut buffer_set, error_json);
+            assert!(matches!(action, Ok(Action::Write)));
+            assert_eq!(buffer_set.write_buffer, password_message(b"\x01"));
+            assert!(matches!(
+                machine.step(&mut buffer_set),
+                Ok(Action::ReadMessage)
+            ));
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::ERROR_RESPONSE,
+                &error_response_payload("28000", "rejected"),
+            )
+            .unwrap_err();
+            assert!(matches!(&err, Error::Server(_)), "{err}");
+        }
+    }
+
+    #[test]
+    fn oauth_bearer_rejection_refuses_authentication_ok() {
+        let options = Opts {
+            oauth_bearer_token_fn: Some(Arc::new(|| Ok("expired".into()))),
+            ..Opts::default()
+        };
+        let mut buffer_set = BufferSet::new();
+        let (mut machine, action) =
+            oauth_rejected_machine(options, &mut buffer_set, OAUTH_ERROR_JSON.as_bytes());
+        assert!(matches!(action, Ok(Action::Write)));
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::ReadMessage)
+        ));
+        let err = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(0, &[]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Auth(message) if message.contains("Expected ErrorResponse")),
+            "{err}"
+        );
+        assert_ne!(machine.state, State::WaitingReady);
+    }
+
+    #[test]
+    fn oauth_bearer_rejects_non_utf8_error_data() {
+        let (discovery_calls, discovery_fn) = recording_discovery_fn();
+        let options = Opts {
+            oauth_bearer_token_fn: Some(Arc::new(|| Ok("tok".into()))),
+            oauth_discovery_fn: Some(discovery_fn),
+            ..Opts::default()
+        };
+        for error_json in [&b"\xff\xfe"[..], b"{\"status\":\"\xc3\x28\"}"] {
+            let mut buffer_set = BufferSet::new();
+            let (_, action) = oauth_rejected_machine(options.clone(), &mut buffer_set, error_json);
+            let err = action.unwrap_err();
+            assert!(matches!(&err, Error::Auth(_)), "{err}");
+        }
+        assert!(discovery_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn oauth_bearer_token_fn_error_propagates() {
+        let options = Opts {
+            password: Some("static".into()),
+            oauth_bearer_token_fn: Some(Arc::new(|| Err(Error::Auth("issuer unreachable".into())))),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        let mut buffer_set = BufferSet::new();
+        let err = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["OAUTHBEARER"]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Auth(message) if message == "issuer unreachable"),
+            "{err}"
+        );
+        assert!(buffer_set.write_buffer.is_empty());
+    }
+
+    #[test]
+    fn oauth_bearer_token_fn_called_once_per_connection_attempt() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let options = Opts {
+            oauth_bearer_token_fn: Some(Arc::new(move || {
+                let call = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(format!("tok{call}").into())
+            })),
+            ..Opts::default()
+        };
+
+        for attempt in 0..2 {
+            let mut machine = auth_machine(options.clone());
+            let mut buffer_set = BufferSet::new();
+            feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &sasl_payload(&["OAUTHBEARER"]),
+            )
+            .unwrap();
+            assert_eq!(
+                buffer_set.write_buffer,
+                oauth_initial_response_message(&format!("tok{attempt}"))
+            );
+            machine.step(&mut buffer_set).unwrap();
+            feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(0, &[]),
+            )
+            .unwrap();
+            assert_eq!(machine.state, State::WaitingReady);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), attempt + 1);
+        }
+    }
+
+    #[test]
+    fn oauth_discovery_requested_without_token_fn() {
+        let (discovery_calls, discovery_fn) = recording_discovery_fn();
+        let options = Opts {
+            oauth_discovery_fn: Some(discovery_fn),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        let mut buffer_set = BufferSet::new();
+        let action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["OAUTHBEARER"]),
+        );
+        assert!(matches!(action, Ok(Action::Write)));
+        assert_eq!(buffer_set.write_buffer, oauth_message_with_auth(""));
+        assert!(discovery_calls.lock().unwrap().is_empty());
+
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::ReadMessage)
+        ));
+        let rejected_action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(11, OAUTH_ERROR_JSON.as_bytes()),
+        );
+        assert!(matches!(rejected_action, Ok(Action::Write)));
+        assert_eq!(buffer_set.write_buffer, password_message(b"\x01"));
+        assert_eq!(*discovery_calls.lock().unwrap(), [OAUTH_ERROR_JSON]);
+
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::ReadMessage)
+        ));
+        let err = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::ERROR_RESPONSE,
+            &error_response_payload("28000", "OAuth bearer authentication failed"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Server(_)), "{err}");
+    }
+
+    #[test]
+    fn oauth_bearer_empty_token_sent_verbatim() {
+        let options = Opts {
+            oauth_bearer_token_fn: Some(Arc::new(|| Ok("".into()))),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        let mut buffer_set = BufferSet::new();
+        let action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["OAUTHBEARER"]),
+        );
+        assert!(matches!(action, Ok(Action::Write)));
+        assert_eq!(buffer_set.write_buffer, oauth_initial_response_message(""));
+        assert_eq!(machine.state, State::OauthInProgressRead);
+    }
+
+    #[test]
+    fn oauth_bearer_token_required_without_oauth_fn() {
+        for options in [
+            Opts::default(),
+            Opts {
+                password: Some("secret".into()),
+                ..Opts::default()
+            },
+        ] {
+            let mut machine = auth_machine(options);
+            let mut buffer_set = BufferSet::new();
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &sasl_payload(&["OAUTHBEARER"]),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::Auth(message) if message.contains("OAuth bearer token required")),
+                "{err}"
+            );
+            assert!(buffer_set.write_buffer.is_empty());
+        }
+    }
+
+    #[test]
+    fn oauth_bearer_token_fn_unused_when_only_scram_offered() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let options = Opts {
+            password: Some("secret".into()),
+            oauth_bearer_token_fn: Some(Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("tok".into())
+            })),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        let mut buffer_set = BufferSet::new();
+        let action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["SCRAM-SHA-256"]),
+        );
+        assert!(matches!(action, Ok(Action::Write)));
+        assert_eq!(machine.state, State::SaslInProgressRead);
+        assert!(machine.scram_client.is_some());
+        assert!(buffer_set.write_buffer[5..].starts_with(b"SCRAM-SHA-256\0"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
