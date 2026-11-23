@@ -361,7 +361,7 @@ mod tests {
             Timestamp::from_binary(oid::TIMESTAMPTZ, &(-1_i64).to_be_bytes()).unwrap(),
             date(1999, 12, 31)
                 .at(23, 59, 59, 999_999_000)
-                .to_zoned(TimeZone::UTC)
+                .to_zoned_datetime(TimeZone::UTC)
                 .unwrap()
                 .timestamp()
         );
@@ -397,7 +397,7 @@ mod tests {
     fn timestamptz_text() {
         let expected = date(2024, 1, 15)
             .at(10, 30, 45, 0)
-            .to_zoned(TimeZone::UTC)
+            .to_zoned_datetime(TimeZone::UTC)
             .unwrap()
             .timestamp();
         for text in [
@@ -427,7 +427,7 @@ mod tests {
         let bytes = total_usecs.to_be_bytes();
         let ts = Timestamp::from_binary(oid::TIMESTAMPTZ, &bytes)
             .unwrap()
-            .to_zoned(TimeZone::UTC);
+            .to_zoned_datetime(TimeZone::UTC);
         assert_eq!(ts.year(), 2024);
         assert_eq!(ts.month(), 1);
         assert_eq!(ts.day(), 15);
