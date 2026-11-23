@@ -63,3 +63,8 @@ let mut opts: Opts = "postgres://test:1234@localhost".try_into()?;
 opts.upgrade_to_unix_socket = false;
 let mut conn = Conn::new(opts)?;
 ```
+
+## Authentication Methods
+
+- Supported: `trust`, `reject`, `scram-sha-256`, `md5`, `password`, `ident`, `peer`, `ldap`, `radius`, `pam`, `bsd`, `cert`
+- Todo: `scram-sha-256` with channel binding, `gss`, `sspi`, `oauth`

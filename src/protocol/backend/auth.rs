@@ -29,7 +29,7 @@ pub enum AuthenticationMessage<'a> {
     KerberosV5,
     /// Cleartext password required
     CleartextPassword,
-    /// MD5 password required (with 4-byte salt)
+    /// (Deprecated in pg18) MD5 password required (with 4-byte salt)
     Md5Password { salt: [u8; 4] },
     /// GSS authentication
     Gss,
