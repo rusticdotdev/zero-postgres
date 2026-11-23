@@ -1,5 +1,7 @@
 //! Connection startup and authentication state machine.
 
+use std::borrow::Cow;
+
 use crate::error::{Error, Result};
 use crate::opts::{Opts, TlsMode};
 use crate::protocol::backend::{
@@ -155,6 +157,12 @@ impl ConnectionStateMachine {
         write_startup(write_buffer, &params);
     }
 
+    fn required_password(&self) -> Result<Cow<'_, str>> {
+        self.options
+            .get_password()?
+            .ok_or_else(|| Error::Auth("Password required but not provided".into()))
+    }
+
     fn handle_auth_message(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
         let type_byte = buffer_set.type_byte;
 
@@ -195,25 +203,17 @@ impl ConnectionStateMachine {
                 Ok(Action::ReadMessage)
             }
             AuthenticationMessage::CleartextPassword => {
-                let password = self
-                    .options
-                    .password
-                    .as_ref()
-                    .ok_or_else(|| Error::Auth("Password required but not provided".into()))?;
+                let password = self.required_password()?;
 
                 buffer_set.write_buffer.clear();
-                write_password(&mut buffer_set.write_buffer, password);
+                write_password(&mut buffer_set.write_buffer, &password);
                 self.state = State::WaitingAuthResultRead;
                 Ok(Action::Write)
             }
             AuthenticationMessage::Md5Password { salt } => {
-                let password = self
-                    .options
-                    .password
-                    .as_ref()
-                    .ok_or_else(|| Error::Auth("Password required but not provided".into()))?;
+                let password = self.required_password()?;
 
-                let hashed = md5_password(&self.options.user, password, &salt);
+                let hashed = md5_password(&self.options.user, &password, &salt);
                 buffer_set.write_buffer.clear();
                 write_password(&mut buffer_set.write_buffer, &hashed);
                 self.state = State::WaitingAuthResultRead;
@@ -228,13 +228,9 @@ impl ConnectionStateMachine {
                     )));
                 }
 
-                let password = self
-                    .options
-                    .password
-                    .as_ref()
-                    .ok_or_else(|| Error::Auth("Password required but not provided".into()))?;
+                let password = self.required_password()?;
 
-                let scram = ScramClient::new(password);
+                let scram = ScramClient::new(&password);
                 let client_first = scram.client_first_message();
 
                 buffer_set.write_buffer.clear();
@@ -452,6 +448,7 @@ impl StateMachine for ConnectionStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn step_negotiate(newest_version: i32, options: &[&str]) -> Result<Action> {
         let mut machine = ConnectionStateMachine::new(Opts::default(), false);
@@ -532,5 +529,274 @@ mod tests {
     #[test]
     fn require_fails_when_tls_unsupported() {
         step_initial(TlsMode::Require, false).unwrap_err();
+    }
+
+    fn auth_machine(options: Opts) -> ConnectionStateMachine {
+        let mut machine = ConnectionStateMachine::new(options, false);
+        machine.state = State::WaitingAuth;
+        machine
+    }
+
+    fn feed(
+        machine: &mut ConnectionStateMachine,
+        buffer_set: &mut BufferSet,
+        type_byte: u8,
+        payload: &[u8],
+    ) -> Result<Action> {
+        buffer_set.type_byte = type_byte;
+        buffer_set.read_buffer.clear();
+        buffer_set.read_buffer.extend_from_slice(payload);
+        machine.step(buffer_set)
+    }
+
+    fn auth_payload(code: i32, data: &[u8]) -> Vec<u8> {
+        let mut payload = code.to_be_bytes().to_vec();
+        payload.extend_from_slice(data);
+        payload
+    }
+
+    fn sasl_payload(mechanisms: &[&str]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for mechanism in mechanisms {
+            data.extend_from_slice(mechanism.as_bytes());
+            data.push(0);
+        }
+        data.push(0);
+        auth_payload(10, &data)
+    }
+
+    fn password_message(body: &[u8]) -> Vec<u8> {
+        let mut message = vec![b'p'];
+        message.extend_from_slice(&(body.len() as i32 + 4).to_be_bytes());
+        message.extend_from_slice(body);
+        message
+    }
+
+    #[test]
+    fn sasl_rejects_unsupported_mechanisms() {
+        for mechanisms in [
+            &[][..],
+            &["SCRAM-SHA-256-PLUS"],
+            &["oauthbearer", "scram-sha-256"],
+            &["PLAIN"],
+        ] {
+            let options = Opts {
+                password: Some("secret".into()),
+                ..Opts::default()
+            };
+            let mut machine = auth_machine(options);
+            let mut buffer_set = BufferSet::new();
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &sasl_payload(mechanisms),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Auth(_)), "{err}");
+            assert!(
+                err.to_string().contains("No supported SASL mechanism"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_fn_used_for_cleartext() {
+        let options = Opts {
+            password_fn: Some(Arc::new(|| Ok("from-fn".into()))),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        let mut buffer_set = BufferSet::new();
+        let action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(3, &[]),
+        );
+        assert!(matches!(action, Ok(Action::Write)));
+        assert_eq!(buffer_set.write_buffer, password_message(b"from-fn\0"));
+        assert_eq!(machine.state, State::WaitingAuthResultRead);
+
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::ReadMessage)
+        ));
+        let ok_action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(0, &[]),
+        );
+        assert!(matches!(ok_action, Ok(Action::ReadMessage)));
+        assert_eq!(machine.state, State::WaitingReady);
+    }
+
+    #[test]
+    fn password_fn_takes_precedence_over_password() {
+        let options = Opts {
+            user: "alice".into(),
+            password: Some("static".into()),
+            password_fn: Some(Arc::new(|| Ok("dynamic".into()))),
+            ..Opts::default()
+        };
+
+        let mut cleartext_machine = auth_machine(options.clone());
+        let mut cleartext_buffer_set = BufferSet::new();
+        feed(
+            &mut cleartext_machine,
+            &mut cleartext_buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(3, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            cleartext_buffer_set.write_buffer,
+            password_message(b"dynamic\0")
+        );
+
+        let salt = [0x01, 0x02, 0x03, 0x04];
+        let mut md5_machine = auth_machine(options);
+        let mut md5_buffer_set = BufferSet::new();
+        feed(
+            &mut md5_machine,
+            &mut md5_buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(5, &salt),
+        )
+        .unwrap();
+        let mut expected = md5_password("alice", "dynamic", &salt).into_bytes();
+        expected.push(0);
+        assert_eq!(md5_buffer_set.write_buffer, password_message(&expected));
+    }
+
+    #[test]
+    fn password_fn_called_once_per_request() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&calls);
+        let options = Opts {
+            password_fn: Some(Arc::new(move || {
+                let call = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(format!("pw{call}"))
+            })),
+            ..Opts::default()
+        };
+
+        let mut cleartext_machine = auth_machine(options.clone());
+        let mut cleartext_buffer_set = BufferSet::new();
+        feed(
+            &mut cleartext_machine,
+            &mut cleartext_buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(3, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            cleartext_buffer_set.write_buffer,
+            password_message(b"pw0\0")
+        );
+
+        let mut scram_machine = auth_machine(options);
+        let mut scram_buffer_set = BufferSet::new();
+        feed(
+            &mut scram_machine,
+            &mut scram_buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["SCRAM-SHA-256"]),
+        )
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn password_fn_error_propagates() {
+        let options = Opts {
+            password: Some("static".into()),
+            password_fn: Some(Arc::new(|| Err(Error::Auth("vault unavailable".into())))),
+            ..Opts::default()
+        };
+        let payloads = [
+            auth_payload(3, &[]),
+            auth_payload(5, &[0, 0, 0, 0]),
+            sasl_payload(&["SCRAM-SHA-256"]),
+        ];
+        for payload in payloads {
+            let mut machine = auth_machine(options.clone());
+            let mut buffer_set = BufferSet::new();
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &payload,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::Auth(message) if message == "vault unavailable"),
+                "{err}"
+            );
+            assert!(buffer_set.write_buffer.is_empty());
+            assert!(machine.scram_client.is_none());
+        }
+    }
+
+    #[test]
+    fn password_fn_may_return_empty_password() {
+        let options = Opts {
+            password_fn: Some(Arc::new(|| Ok(String::new()))),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        let mut buffer_set = BufferSet::new();
+        feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(3, &[]),
+        )
+        .unwrap();
+        assert_eq!(buffer_set.write_buffer, password_message(b"\0"));
+    }
+
+    #[test]
+    fn password_used_without_password_fn() {
+        let options = Opts {
+            password: Some("static".into()),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        let mut buffer_set = BufferSet::new();
+        feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(3, &[]),
+        )
+        .unwrap();
+        assert_eq!(buffer_set.write_buffer, password_message(b"static\0"));
+    }
+
+    #[test]
+    fn password_required_without_password_or_password_fn() {
+        let payloads = [
+            auth_payload(3, &[]),
+            auth_payload(5, &[0, 0, 0, 0]),
+            sasl_payload(&["SCRAM-SHA-256"]),
+        ];
+        for payload in payloads {
+            let mut machine = auth_machine(Opts::default());
+            let mut buffer_set = BufferSet::new();
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &payload,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::Auth(message) if message.contains("Password required")),
+                "{err}"
+            );
+        }
     }
 }

@@ -1,5 +1,6 @@
 //! Connection options.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use url::Url;
@@ -20,7 +21,7 @@ pub enum TlsMode {
 }
 
 /// Connection options for PostgreSQL.
-#[derive(Debug, Clone)]
+#[derive(derive_more::Debug, Clone)]
 pub struct Opts {
     /// Hostname or IP address.
     ///
@@ -50,7 +51,15 @@ pub struct Opts {
     /// Password for authentication.
     ///
     /// Default: `None`
+    #[debug("{}", if password.is_some() { "Some(***)" } else { "None" })]
     pub password: Option<String>,
+
+    #[debug("{}", if password_fn.is_some() { "Some(..)" } else { "None" })]
+    pub password_fn: Option<Arc<dyn Fn() -> Result<String, Error> + Send + Sync>>,
+
+    #[debug("{}", if oauth_bearer_token_fn.is_some() { "Some(..)" } else { "None" })]
+    pub oauth_bearer_token_fn:
+        Option<Arc<dyn Fn() -> Result<Cow<'static, str>, Error> + Send + Sync>>,
 
     /// Application name to report to the server.
     ///
@@ -122,6 +131,15 @@ pub struct Opts {
     pub buffer_pool: Arc<BufferPool>,
 }
 
+impl Opts {
+    pub(crate) fn get_password(&self) -> Result<Option<Cow<'_, str>>, Error> {
+        if let Some(password_fn) = &self.password_fn {
+            return password_fn().map(|password| Some(Cow::Owned(password)));
+        }
+        Ok(self.password.as_deref().map(Cow::Borrowed))
+    }
+}
+
 impl Default for Opts {
     fn default() -> Self {
         Self {
@@ -131,6 +149,8 @@ impl Default for Opts {
             user: String::new(),
             database: None,
             password: None,
+            password_fn: None,
+            oauth_bearer_token_fn: None,
             application_name: None,
             tls_mode: TlsMode::Prefer,
             #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
@@ -277,5 +297,66 @@ mod tests {
     #[test]
     fn rejects_invalid_utf8() {
         Opts::try_from("postgres://alice:%FF@localhost/db").unwrap_err();
+    }
+
+    #[test]
+    fn password_fn_debug_shows_presence_only() {
+        let without_fn = format!("{:?}", Opts::default());
+        assert!(without_fn.contains("password_fn: None"), "{without_fn}");
+
+        let opts = Opts {
+            password_fn: Some(Arc::new(|| Ok("secret".into()))),
+            ..Opts::default()
+        };
+        let with_fn = format!("{opts:?}");
+        assert!(with_fn.contains("password_fn: Some(..)"), "{with_fn}");
+        assert!(!with_fn.contains("secret"), "{with_fn}");
+    }
+
+    #[test]
+    fn password_debug_shows_presence_only() {
+        let without_password = format!("{:?}", Opts::default());
+        assert!(
+            without_password.contains("password: None"),
+            "{without_password}"
+        );
+
+        let opts = Opts {
+            password: Some("secret".into()),
+            ..Opts::default()
+        };
+        let with_password = format!("{opts:?}");
+        assert!(
+            with_password.contains("password: Some(***)"),
+            "{with_password}"
+        );
+        assert!(!with_password.contains("secret"), "{with_password}");
+    }
+
+    #[test]
+    fn oauth_bearer_token_fn_debug_shows_presence_only() {
+        let without_fn = format!("{:?}", Opts::default());
+        assert!(
+            without_fn.contains("oauth_bearer_token_fn: None"),
+            "{without_fn}"
+        );
+
+        let opts = Opts {
+            oauth_bearer_token_fn: Some(Arc::new(|| Ok("secret".into()))),
+            ..Opts::default()
+        };
+        let with_fn = format!("{opts:?}");
+        assert!(
+            with_fn.contains("oauth_bearer_token_fn: Some(..)"),
+            "{with_fn}"
+        );
+        assert!(!with_fn.contains("secret"), "{with_fn}");
+    }
+
+    #[test]
+    fn new_auth_options_default_to_none() {
+        let opts = Opts::default();
+        assert!(opts.password_fn.is_none());
+        assert!(opts.oauth_bearer_token_fn.is_none());
     }
 }

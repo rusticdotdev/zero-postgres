@@ -33,6 +33,7 @@ diesel = ["dep:diesel", "sync"]
 
 [dependencies]
 thiserror = "2"
+derive_more = { version = "2", default-features = false, features = ["debug"] }
 tokio = { version = "1", features = ["sync"], optional = true }
 rustls = { version = "0.23", optional = true }
 rustls-platform-verifier = { version = "0.7", optional = true }
