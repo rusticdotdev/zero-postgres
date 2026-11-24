@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse URL and force TLS
     let mut opts: Opts = url.as_str().try_into()?;
-    opts.tls_mode = TlsMode::Require;
+    opts.tls_mode = TlsMode::Pki;
 
     println!("Connecting with TLS...");
     let mut conn = Conn::new(opts)?;

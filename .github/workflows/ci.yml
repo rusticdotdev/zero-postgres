@@ -61,7 +61,7 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
         env:
-          DATABASE_URL: postgres://test:1234@localhost/test?tls_mode=disable
+          DATABASE_URL: postgres://test:1234@localhost/test
 
   coverage:
     name: Coverage
@@ -91,7 +91,7 @@ jobs:
       - name: Generate coverage report
         run: cargo llvm-cov --all-features --lcov --output-path lcov.info
         env:
-          DATABASE_URL: postgres://test:1234@localhost/test?tls_mode=disable
+          DATABASE_URL: postgres://test:1234@localhost/test
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:

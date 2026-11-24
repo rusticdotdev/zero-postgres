@@ -1,7 +1,9 @@
 use std::sync::{Arc, OnceLock};
 
-use rustls::ClientConfig;
-use rustls::pki_types::CertificateDer;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_platform_verifier::BuilderVerifierExt;
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use x509_cert::Certificate;
@@ -15,39 +17,104 @@ use x509_cert::der::oid::db::rfc5912::{
 use crate::error::{Error, Result};
 use crate::opts::Opts;
 
-/// Returns `opts.tls_config`, or the shared platform config when it is unset.
 pub fn client_config(opts: &Opts) -> Result<Arc<ClientConfig>> {
     match &opts.tls_config {
         Some(config) => Ok(Arc::clone(config)),
-        None => platform_client_config(),
+        None if opts.tls_mode.requires_certificate_verification() => platform_client_config(),
+        None => unverified_client_config(),
     }
 }
 
-/// Returns the rustls client config shared by all TLS connections without
-/// `Opts::tls_config`.
-///
-/// The platform verifier is built on the first call and reused afterwards.
 fn platform_client_config() -> Result<Arc<ClientConfig>> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     if let Some(config) = CONFIG.get() {
         return Ok(Arc::clone(config));
     }
-    let config = Arc::new(build_client_config()?);
+    let config = Arc::new(
+        ClientConfig::builder_with_provider(crypto_provider())
+            .with_safe_default_protocol_versions()?
+            .with_platform_verifier()?
+            .with_no_client_auth(),
+    );
     Ok(Arc::clone(CONFIG.get_or_init(|| config)))
 }
 
-fn build_client_config() -> Result<ClientConfig> {
-    // An explicit provider avoids a panic when both aws-lc-rs and ring are
-    // enabled in the dependency graph and no process default is installed.
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    Ok(ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .with_platform_verifier()?
-        .with_no_client_auth())
+fn unverified_client_config() -> Result<Arc<ClientConfig>> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    if let Some(config) = CONFIG.get() {
+        return Ok(Arc::clone(config));
+    }
+    let provider = crypto_provider();
+    let config = Arc::new(
+        ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification { provider }))
+            .with_no_client_auth(),
+    );
+    Ok(Arc::clone(CONFIG.get_or_init(|| config)))
 }
 
-pub fn server_name(host: &str) -> Result<rustls::pki_types::ServerName<'static>> {
-    rustls::pki_types::ServerName::try_from(host.to_owned())
+fn crypto_provider() -> Arc<CryptoProvider> {
+    // An explicit provider avoids a panic when both aws-lc-rs and ring are
+    // enabled in the dependency graph and no process default is installed.
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+pub fn server_name(host: &str) -> Result<ServerName<'static>> {
+    ServerName::try_from(host.to_owned())
         .map_err(|e| Error::InvalidUsage(format!("invalid TLS server name {host:?}: {e}")))
 }
 
@@ -157,5 +224,131 @@ pub(crate) mod tests {
             tls_server_end_point(&CertificateDer::from(Vec::new())),
             None
         );
+    }
+
+    use crate::opts::TlsMode;
+    use rustls::internal::msgs::codec::{Codec, Reader};
+
+    fn user_tls_config() -> Arc<ClientConfig> {
+        let provider = crypto_provider();
+        Arc::new(
+            ClientConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification { provider }))
+                .with_no_client_auth(),
+        )
+    }
+
+    fn no_certificate_verification() -> NoCertificateVerification {
+        NoCertificateVerification {
+            provider: crypto_provider(),
+        }
+    }
+
+    fn digitally_signed(scheme: u16, signature: &[u8]) -> DigitallySignedStruct {
+        let mut encoded = scheme.to_be_bytes().to_vec();
+        encoded.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+        encoded.extend_from_slice(signature);
+        DigitallySignedStruct::read(&mut Reader::init(&encoded)).unwrap()
+    }
+
+    #[test]
+    fn client_config_returns_user_tls_config_for_every_tls_mode() {
+        let config = user_tls_config();
+        for tls_mode in TlsMode::ALL {
+            let opts = Opts {
+                tls_mode,
+                tls_config: Some(Arc::clone(&config)),
+                ..Opts::default()
+            };
+            let first = client_config(&opts).unwrap();
+            let second = client_config(&opts).unwrap();
+            assert!(Arc::ptr_eq(&first, &config), "{tls_mode:?}");
+            assert!(Arc::ptr_eq(&second, &config), "{tls_mode:?}");
+        }
+    }
+
+    #[test]
+    fn client_config_shares_unverified_config_without_certificate_verification() {
+        let insecure = Opts::default();
+        let channel_binding = Opts {
+            tls_mode: TlsMode::ChannelBinding,
+            ..Opts::default()
+        };
+        let first = client_config(&insecure).unwrap();
+        let second = client_config(&insecure).unwrap();
+        let third = client_config(&channel_binding).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first, &third));
+        assert!(Arc::ptr_eq(&first, &unverified_client_config().unwrap()));
+        assert!(!Arc::ptr_eq(&first, &user_tls_config()));
+    }
+
+    #[test]
+    fn client_config_shares_platform_config_with_certificate_verification() {
+        let pki = Opts {
+            tls_mode: TlsMode::Pki,
+            ..Opts::default()
+        };
+        let hardened = Opts {
+            tls_mode: TlsMode::Hardened,
+            ..Opts::default()
+        };
+        let first = client_config(&pki).unwrap();
+        let second = client_config(&hardened).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &unverified_client_config().unwrap()));
+    }
+
+    #[test]
+    fn no_certificate_verification_accepts_any_certificate() {
+        let verifier = no_certificate_verification();
+        let server_name = server_name("db.example.test").unwrap();
+        for certificate in [
+            decode(ECDSA_SHA256_CERTIFICATE),
+            decode(ED25519_CERTIFICATE),
+            b"not a certificate".to_vec(),
+            Vec::new(),
+        ] {
+            verifier
+                .verify_server_cert(
+                    &CertificateDer::from(certificate),
+                    &[CertificateDer::from(b"garbage".to_vec())],
+                    &server_name,
+                    b"ocsp",
+                    UnixTime::since_unix_epoch(std::time::Duration::ZERO),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn no_certificate_verification_still_checks_handshake_signatures() {
+        let verifier = no_certificate_verification();
+        let certificate = CertificateDer::from(decode(ECDSA_SHA256_CERTIFICATE));
+        let dss = digitally_signed(0x0403, &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]);
+        verifier
+            .verify_tls12_signature(b"handshake", &certificate, &dss)
+            .unwrap_err();
+        verifier
+            .verify_tls13_signature(b"handshake", &certificate, &dss)
+            .unwrap_err();
+
+        let garbage_certificate = CertificateDer::from(b"not a certificate".to_vec());
+        verifier
+            .verify_tls13_signature(b"handshake", &garbage_certificate, &dss)
+            .unwrap_err();
+    }
+
+    #[test]
+    fn no_certificate_verification_supports_provider_schemes() {
+        let verifier = no_certificate_verification();
+        let schemes = verifier.supported_verify_schemes();
+        assert!(!schemes.is_empty());
+        assert!(schemes.contains(&SignatureScheme::ECDSA_NISTP256_SHA256));
+        assert!(schemes.contains(&SignatureScheme::ED25519));
+        assert!(schemes.contains(&SignatureScheme::RSA_PSS_SHA256));
     }
 }

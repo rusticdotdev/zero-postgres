@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use crate::error::{Error, Result};
 #[cfg(feature = "auth-gss")]
 use crate::gss::{GssClient, GssStep};
-use crate::opts::{Opts, TlsMode};
+use crate::opts::Opts;
 use crate::protocol::backend::{
     AuthenticationMessage, BackendKeyData, ErrorResponse, NegotiateProtocolVersion,
     ParameterStatus, RawMessage, ReadyForQuery, msg_type,
@@ -128,16 +128,12 @@ impl ConnectionStateMachine {
     fn handle_initial(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
         buffer_set.write_buffer.clear();
 
-        let send_ssl_request = match self.options.tls_mode {
-            TlsMode::Disable => false,
-            TlsMode::Prefer => self.tls_supported,
-            TlsMode::Require if !self.tls_supported => {
-                return Err(Error::Unsupported(
-                    "TLS requested but TLS feature not enabled".into(),
-                ));
-            }
-            TlsMode::Require => true,
-        };
+        if self.options.tls_mode.requires_tls() && !self.tls_supported {
+            return Err(Error::Unsupported(
+                "TLS requested but TLS feature not enabled".into(),
+            ));
+        }
+        let send_ssl_request = self.tls_supported;
 
         if send_ssl_request {
             write_ssl_request(&mut buffer_set.write_buffer);
@@ -157,7 +153,7 @@ impl ConnectionStateMachine {
                 Ok(Action::TlsHandshake)
             }
             b'N' => {
-                if self.options.tls_mode == TlsMode::Require {
+                if self.options.tls_mode.requires_tls() {
                     return Err(Error::Auth(
                         "TLS requested but not supported by server".into(),
                     ));
@@ -259,6 +255,15 @@ impl ConnectionStateMachine {
 
         let auth = AuthenticationMessage::parse(&buffer_set.read_buffer)?;
 
+        if self.options.tls_mode.requires_channel_binding()
+            && !matches!(auth, AuthenticationMessage::Sasl { .. })
+        {
+            return Err(Error::Auth(format!(
+                "Channel binding is required but the server requested {:?}",
+                auth
+            )));
+        }
+
         match auth {
             AuthenticationMessage::Ok => {
                 self.state = State::WaitingReady;
@@ -291,6 +296,17 @@ impl ConnectionStateMachine {
                     let scram =
                         ScramClient::new_with_channel_binding(&password, channel_binding_data);
                     return Ok(self.start_scram("SCRAM-SHA-256-PLUS", scram, buffer_set));
+                }
+
+                if self.options.tls_mode.requires_channel_binding() {
+                    return Err(Error::Auth(if mechanisms.contains(&"SCRAM-SHA-256-PLUS") {
+                        "Channel binding is required but tls-server-end-point is undefined for the server certificate".into()
+                    } else {
+                        format!(
+                            "Channel binding is required but the server does not offer SCRAM-SHA-256-PLUS. Server offers: {:?}",
+                            mechanisms
+                        )
+                    }));
                 }
 
                 if mechanisms.contains(&"SCRAM-SHA-256") {
@@ -707,6 +723,7 @@ impl StateMachine for ConnectionStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opts::TlsMode;
     use std::sync::Arc;
 
     fn step_negotiate(newest_version: i32, options: &[&str]) -> Result<Action> {
@@ -752,42 +769,133 @@ mod tests {
         step_negotiate(PROTOCOL_VERSION_3_0, &["_pq_.unknown"]).unwrap_err();
     }
 
-    fn step_initial(tls_mode: TlsMode, tls_supported: bool) -> Result<Action> {
+    const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F];
+
+    #[test]
+    fn initial_step_sends_ssl_request_when_tls_supported() {
+        for tls_mode in TlsMode::ALL {
+            let options = Opts {
+                tls_mode,
+                ..Opts::default()
+            };
+            let mut machine = ConnectionStateMachine::new(options, true);
+            let mut buffer_set = BufferSet::new();
+            buffer_set.write_buffer.extend_from_slice(b"stale");
+            let action = machine.step(&mut buffer_set);
+            assert!(
+                matches!(action, Ok(Action::WriteAndReadByte)),
+                "{tls_mode:?}"
+            );
+            assert_eq!(buffer_set.write_buffer, SSL_REQUEST, "{tls_mode:?}");
+            assert_eq!(machine.state, State::WaitingSslResponse, "{tls_mode:?}");
+        }
+    }
+
+    #[test]
+    fn initial_step_without_tls_support_allows_only_insecure() {
+        for tls_mode in TlsMode::ALL {
+            let options = Opts {
+                user: "alice".into(),
+                tls_mode,
+                ..Opts::default()
+            };
+            let mut machine = ConnectionStateMachine::new(options, false);
+            let mut buffer_set = BufferSet::new();
+            let result = machine.step(&mut buffer_set);
+            if tls_mode == TlsMode::Insecure {
+                assert!(matches!(result, Ok(Action::Write)), "{tls_mode:?}");
+                assert_eq!(machine.state, State::WaitingAuthRead);
+                assert_ne!(buffer_set.write_buffer[..], SSL_REQUEST);
+                assert!(
+                    buffer_set
+                        .write_buffer
+                        .windows(b"user\0alice\0".len())
+                        .any(|window| window == b"user\0alice\0")
+                );
+            } else {
+                let err = result.unwrap_err();
+                assert!(matches!(err, Error::Unsupported(_)), "{tls_mode:?}: {err}");
+                assert_eq!(machine.state, State::Initial, "{tls_mode:?}");
+                assert!(buffer_set.write_buffer.is_empty(), "{tls_mode:?}");
+            }
+        }
+    }
+
+    fn ssl_response_machine(tls_mode: TlsMode) -> (ConnectionStateMachine, BufferSet) {
         let options = Opts {
+            user: "alice".into(),
             tls_mode,
             ..Opts::default()
         };
-        let mut machine = ConnectionStateMachine::new(options, tls_supported);
-        machine.step(&mut BufferSet::new())
-    }
-
-    #[test]
-    fn prefer_sends_ssl_request_when_tls_supported() {
+        let mut machine = ConnectionStateMachine::new(options, true);
+        let mut buffer_set = BufferSet::new();
         assert!(matches!(
-            step_initial(TlsMode::Prefer, true),
+            machine.step(&mut buffer_set),
             Ok(Action::WriteAndReadByte)
         ));
+        (machine, buffer_set)
     }
 
     #[test]
-    fn prefer_skips_ssl_request_when_tls_unsupported() {
-        assert!(matches!(
-            step_initial(TlsMode::Prefer, false),
-            Ok(Action::Write)
-        ));
+    fn ssl_response_refused_allows_only_insecure() {
+        for tls_mode in TlsMode::ALL {
+            let (mut machine, mut buffer_set) = ssl_response_machine(tls_mode);
+            machine.set_ssl_response(b'N');
+            let result = machine.step(&mut buffer_set);
+            if tls_mode == TlsMode::Insecure {
+                assert!(matches!(result, Ok(Action::Write)), "{tls_mode:?}");
+                assert_eq!(machine.state, State::WaitingAuthRead);
+                assert_ne!(buffer_set.write_buffer[..], SSL_REQUEST);
+                assert!(
+                    buffer_set
+                        .write_buffer
+                        .windows(b"user\0alice\0".len())
+                        .any(|window| window == b"user\0alice\0")
+                );
+                assert!(matches!(
+                    machine.step(&mut buffer_set),
+                    Ok(Action::ReadMessage)
+                ));
+                assert_eq!(machine.state, State::WaitingAuth);
+            } else {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(&err, Error::Auth(message) if message.contains("not supported by server")),
+                    "{tls_mode:?}: {err}"
+                );
+                assert_eq!(machine.state, State::WaitingSslResponse, "{tls_mode:?}");
+            }
+        }
     }
 
     #[test]
-    fn require_sends_ssl_request_when_tls_supported() {
-        assert!(matches!(
-            step_initial(TlsMode::Require, true),
-            Ok(Action::WriteAndReadByte)
-        ));
+    fn ssl_response_accepted_starts_tls_handshake_for_every_tls_mode() {
+        for tls_mode in TlsMode::ALL {
+            let (mut machine, mut buffer_set) = ssl_response_machine(tls_mode);
+            machine.set_ssl_response(b'S');
+            assert!(
+                matches!(machine.step(&mut buffer_set), Ok(Action::TlsHandshake)),
+                "{tls_mode:?}"
+            );
+            assert_eq!(machine.state, State::WaitingTlsHandshake);
+            assert!(matches!(machine.step(&mut buffer_set), Ok(Action::Write)));
+            assert_eq!(machine.state, State::WaitingAuthRead);
+        }
     }
 
     #[test]
-    fn require_fails_when_tls_unsupported() {
-        step_initial(TlsMode::Require, false).unwrap_err();
+    fn ssl_response_unexpected_byte_is_library_bug_for_every_tls_mode() {
+        for tls_mode in TlsMode::ALL {
+            for response in [0, b'E', b's', b'n'] {
+                let (mut machine, mut buffer_set) = ssl_response_machine(tls_mode);
+                machine.set_ssl_response(response);
+                let err = machine.step(&mut buffer_set).unwrap_err();
+                assert!(
+                    matches!(err, Error::LibraryBug(_)),
+                    "{tls_mode:?} {response}: {err}"
+                );
+            }
+        }
     }
 
     fn auth_machine(options: Opts) -> ConnectionStateMachine {
@@ -1699,5 +1807,465 @@ mod tests {
             client_final.contains(&format!(",r={client_nonce}server,p=")),
             "{client_final}"
         );
+    }
+
+    const CHANNEL_BINDING_TLS_MODES: [TlsMode; 2] = [TlsMode::ChannelBinding, TlsMode::Hardened];
+
+    fn tls_mode_auth_machine(
+        tls_mode: TlsMode,
+        encoded_certificate: Option<&str>,
+    ) -> ConnectionStateMachine {
+        let options = Opts {
+            password: Some("secret".into()),
+            oauth_bearer_token_fn: Some(Arc::new(|| Ok("token".into()))),
+            tls_mode,
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        if let Some(encoded_certificate) = encoded_certificate {
+            machine.set_server_certificate_der(decode_base64(encoded_certificate));
+        }
+        machine
+    }
+
+    fn assert_channel_binding_error(
+        machine: &ConnectionStateMachine,
+        buffer_set: &BufferSet,
+        result: Result<Action>,
+        expected: &str,
+    ) {
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, Error::Auth(message) if message.contains(expected)),
+            "{err}"
+        );
+        assert!(buffer_set.write_buffer.is_empty());
+        assert!(machine.scram_client.is_none());
+        assert_eq!(machine.state, State::WaitingAuth);
+    }
+
+    #[test]
+    fn channel_binding_rejects_non_sasl_authentication() {
+        let payloads = [
+            auth_payload(0, &[]),
+            auth_payload(2, &[]),
+            auth_payload(3, &[]),
+            auth_payload(5, &[0x01, 0x02, 0x03, 0x04]),
+            auth_payload(7, &[]),
+            auth_payload(8, b"token"),
+            auth_payload(9, &[]),
+            auth_payload(11, b"r=nonce,s=c2FsdA==,i=4096"),
+            auth_payload(12, b"v=c2lnbmF0dXJl"),
+        ];
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            for payload in &payloads {
+                let mut machine = tls_mode_auth_machine(tls_mode, None);
+                let mut buffer_set = BufferSet::new();
+                let result = feed(
+                    &mut machine,
+                    &mut buffer_set,
+                    msg_type::AUTHENTICATION,
+                    payload,
+                );
+                assert_channel_binding_error(
+                    &machine,
+                    &buffer_set,
+                    result,
+                    "Channel binding is required but the server requested",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn channel_binding_rejects_sasl_without_plus() {
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            for mechanisms in [
+                &[][..],
+                &["SCRAM-SHA-256"],
+                &["OAUTHBEARER"],
+                &["SCRAM-SHA-256", "OAUTHBEARER"],
+                &["scram-sha-256-plus", "SCRAM-SHA-256"],
+                &[
+                    "SCRAM-SHA-256-PLU",
+                    "SCRAM-SHA-256-PLUS ",
+                    "SCRAM-SHA-1-PLUS",
+                ],
+            ] {
+                let mut machine = tls_mode_auth_machine(tls_mode, None);
+                let mut buffer_set = BufferSet::new();
+                let result = feed(
+                    &mut machine,
+                    &mut buffer_set,
+                    msg_type::AUTHENTICATION,
+                    &sasl_payload(mechanisms),
+                );
+                assert_channel_binding_error(
+                    &machine,
+                    &buffer_set,
+                    result,
+                    "server does not offer SCRAM-SHA-256-PLUS",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn channel_binding_rejects_plus_without_server_certificate() {
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            for mechanisms in [
+                &["SCRAM-SHA-256-PLUS"][..],
+                &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
+                &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS", "OAUTHBEARER"],
+            ] {
+                let mut machine = tls_mode_auth_machine(tls_mode, None);
+                let mut buffer_set = BufferSet::new();
+                let result = feed(
+                    &mut machine,
+                    &mut buffer_set,
+                    msg_type::AUTHENTICATION,
+                    &sasl_payload(mechanisms),
+                );
+                assert_channel_binding_error(
+                    &machine,
+                    &buffer_set,
+                    result,
+                    "tls-server-end-point is undefined",
+                );
+            }
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn channel_binding_rejects_plus_with_unhashable_server_certificate() {
+        use crate::tls::tests::ED25519_CERTIFICATE;
+
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            for encoded_certificate in [ED25519_CERTIFICATE, "bm90IGEgY2VydGlmaWNhdGU=", ""] {
+                let mut machine = tls_mode_auth_machine(tls_mode, Some(encoded_certificate));
+                let mut buffer_set = BufferSet::new();
+                let result = feed(
+                    &mut machine,
+                    &mut buffer_set,
+                    msg_type::AUTHENTICATION,
+                    &sasl_payload(&["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"]),
+                );
+                assert_channel_binding_error(
+                    &machine,
+                    &buffer_set,
+                    result,
+                    "tls-server-end-point is undefined",
+                );
+            }
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn channel_binding_rejects_sasl_without_plus_even_with_server_certificate() {
+        use crate::tls::tests::ECDSA_SHA256_CERTIFICATE;
+
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            for mechanisms in [&["SCRAM-SHA-256"][..], &["OAUTHBEARER"], &[]] {
+                let mut machine = tls_mode_auth_machine(tls_mode, Some(ECDSA_SHA256_CERTIFICATE));
+                let mut buffer_set = BufferSet::new();
+                let result = feed(
+                    &mut machine,
+                    &mut buffer_set,
+                    msg_type::AUTHENTICATION,
+                    &sasl_payload(mechanisms),
+                );
+                assert_channel_binding_error(
+                    &machine,
+                    &buffer_set,
+                    result,
+                    "server does not offer SCRAM-SHA-256-PLUS",
+                );
+            }
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn channel_binding_starts_scram_plus_with_server_certificate() {
+        use crate::tls::tests::ECDSA_SHA256_CERTIFICATE;
+
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            for mechanisms in [
+                &["SCRAM-SHA-256-PLUS"][..],
+                &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"],
+                &["OAUTHBEARER", "SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
+            ] {
+                let mut machine = tls_mode_auth_machine(tls_mode, Some(ECDSA_SHA256_CERTIFICATE));
+                let mut buffer_set = BufferSet::new();
+                let action = feed(
+                    &mut machine,
+                    &mut buffer_set,
+                    msg_type::AUTHENTICATION,
+                    &sasl_payload(mechanisms),
+                );
+                assert!(matches!(action, Ok(Action::Write)), "{tls_mode:?}");
+                assert_eq!(machine.state, State::SaslInProgressRead);
+                assert!(machine.scram_client.is_some());
+                let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+                assert_eq!(mechanism, "SCRAM-SHA-256-PLUS");
+                assert!(
+                    client_first.starts_with("p=tls-server-end-point,,n=,r="),
+                    "{client_first}"
+                );
+                assert!(matches!(
+                    machine.step(&mut buffer_set),
+                    Ok(Action::ReadMessage)
+                ));
+                assert_eq!(machine.state, State::SaslInProgress);
+            }
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    fn scram_plus_after_client_first(tls_mode: TlsMode) -> (ConnectionStateMachine, BufferSet) {
+        use crate::tls::tests::ECDSA_SHA256_CERTIFICATE;
+
+        let mut machine = tls_mode_auth_machine(tls_mode, Some(ECDSA_SHA256_CERTIFICATE));
+        let mut buffer_set = BufferSet::new();
+        feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["SCRAM-SHA-256-PLUS"]),
+        )
+        .unwrap();
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::ReadMessage)
+        ));
+        assert_eq!(machine.state, State::SaslInProgress);
+        (machine, buffer_set)
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    fn scram_plus_after_client_final(tls_mode: TlsMode) -> (ConnectionStateMachine, BufferSet) {
+        let (mut machine, mut buffer_set) = scram_plus_after_client_first(tls_mode);
+        let (_, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+        let client_nonce = client_first
+            .strip_prefix("p=tls-server-end-point,,n=,r=")
+            .unwrap()
+            .to_string();
+        let server_first = format!("r={client_nonce}server,s=c2FsdA==,i=4096");
+        assert!(matches!(
+            feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(11, server_first.as_bytes()),
+            ),
+            Ok(Action::Write)
+        ));
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::ReadMessage)
+        ));
+        assert_eq!(machine.state, State::SaslInProgress);
+        (machine, buffer_set)
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn channel_binding_rejects_authentication_ok_after_client_first() {
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            let (mut machine, mut buffer_set) = scram_plus_after_client_first(tls_mode);
+            feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(0, &[]),
+            )
+            .unwrap_err();
+            assert_ne!(machine.state, State::WaitingReady);
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn channel_binding_rejects_authentication_ok_after_client_final() {
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            let (mut machine, mut buffer_set) = scram_plus_after_client_final(tls_mode);
+            feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(0, &[]),
+            )
+            .unwrap_err();
+            assert_ne!(machine.state, State::WaitingReady);
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn channel_binding_rejects_forged_server_final() {
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            let (mut machine, mut buffer_set) = scram_plus_after_client_final(tls_mode);
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(12, b"v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Auth(_)), "{err}");
+            assert_ne!(machine.state, State::WaitingReady);
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn channel_binding_requires_password_for_scram_plus() {
+        use crate::tls::tests::ECDSA_SHA256_CERTIFICATE;
+
+        for tls_mode in CHANNEL_BINDING_TLS_MODES {
+            let options = Opts {
+                tls_mode,
+                ..Opts::default()
+            };
+            let mut machine = auth_machine(options);
+            machine.set_server_certificate_der(decode_base64(ECDSA_SHA256_CERTIFICATE));
+            let mut buffer_set = BufferSet::new();
+            let result = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &sasl_payload(&["SCRAM-SHA-256-PLUS"]),
+            );
+            assert_channel_binding_error(&machine, &buffer_set, result, "Password required");
+        }
+    }
+
+    #[test]
+    fn non_channel_binding_tls_mode_accepts_authentication_ok() {
+        for tls_mode in [TlsMode::Insecure, TlsMode::Pki] {
+            let mut machine = tls_mode_auth_machine(tls_mode, None);
+            let mut buffer_set = BufferSet::new();
+            let action = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(0, &[]),
+            );
+            assert!(matches!(action, Ok(Action::ReadMessage)), "{tls_mode:?}");
+            assert_eq!(machine.state, State::WaitingReady);
+        }
+    }
+
+    #[test]
+    fn non_channel_binding_tls_mode_accepts_password_authentication() {
+        for tls_mode in [TlsMode::Insecure, TlsMode::Pki] {
+            let mut cleartext_machine = tls_mode_auth_machine(tls_mode, None);
+            let mut cleartext_buffer_set = BufferSet::new();
+            let cleartext_action = feed(
+                &mut cleartext_machine,
+                &mut cleartext_buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(3, &[]),
+            );
+            assert!(
+                matches!(cleartext_action, Ok(Action::Write)),
+                "{tls_mode:?}"
+            );
+            assert_eq!(
+                cleartext_buffer_set.write_buffer,
+                password_message(b"secret\0")
+            );
+
+            let mut md5_machine = tls_mode_auth_machine(tls_mode, None);
+            let mut md5_buffer_set = BufferSet::new();
+            let md5_action = feed(
+                &mut md5_machine,
+                &mut md5_buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(5, &[0x01, 0x02, 0x03, 0x04]),
+            );
+            assert!(matches!(md5_action, Ok(Action::Write)), "{tls_mode:?}");
+            assert_eq!(md5_machine.state, State::WaitingAuthResultRead);
+        }
+    }
+
+    #[test]
+    fn non_channel_binding_tls_mode_falls_back_to_scram_and_oauth() {
+        for tls_mode in [TlsMode::Insecure, TlsMode::Pki] {
+            for mechanisms in [
+                &["SCRAM-SHA-256"][..],
+                &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
+            ] {
+                let mut machine = tls_mode_auth_machine(tls_mode, None);
+                let mut buffer_set = BufferSet::new();
+                let action = feed(
+                    &mut machine,
+                    &mut buffer_set,
+                    msg_type::AUTHENTICATION,
+                    &sasl_payload(mechanisms),
+                );
+                assert!(matches!(action, Ok(Action::Write)), "{tls_mode:?}");
+                let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+                assert_eq!(mechanism, "SCRAM-SHA-256");
+                assert!(client_first.starts_with("n,,n=,r="), "{client_first}");
+            }
+
+            let mut machine = tls_mode_auth_machine(tls_mode, None);
+            let mut buffer_set = BufferSet::new();
+            let action = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &sasl_payload(&["OAUTHBEARER"]),
+            );
+            assert!(matches!(action, Ok(Action::Write)), "{tls_mode:?}");
+            assert_eq!(
+                buffer_set.write_buffer,
+                oauth_initial_response_message("token")
+            );
+            assert_eq!(machine.state, State::OauthInProgressRead);
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn pki_keeps_channel_binding_preferences() {
+        use crate::tls::tests::{ECDSA_SHA256_CERTIFICATE, ED25519_CERTIFICATE};
+
+        for (encoded_certificate, mechanisms, expected_mechanism, expected_prefix) in [
+            (
+                ECDSA_SHA256_CERTIFICATE,
+                &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"][..],
+                "SCRAM-SHA-256-PLUS",
+                "p=tls-server-end-point,,n=,r=",
+            ),
+            (
+                ECDSA_SHA256_CERTIFICATE,
+                &["SCRAM-SHA-256"],
+                "SCRAM-SHA-256",
+                "y,,n=,r=",
+            ),
+            (
+                ED25519_CERTIFICATE,
+                &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
+                "SCRAM-SHA-256",
+                "n,,n=,r=",
+            ),
+        ] {
+            let mut machine = tls_mode_auth_machine(TlsMode::Pki, Some(encoded_certificate));
+            let mut buffer_set = BufferSet::new();
+            let action = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &sasl_payload(mechanisms),
+            );
+            assert!(matches!(action, Ok(Action::Write)));
+            let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+            assert_eq!(mechanism, expected_mechanism);
+            assert!(client_first.starts_with(expected_prefix), "{client_first}");
+        }
     }
 }

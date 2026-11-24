@@ -8,16 +8,40 @@ use url::Url;
 use crate::buffer_pool::{BufferPool, GLOBAL_BUFFER_POOL};
 use crate::error::Error;
 
-/// TLS connection mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsMode {
-    /// Don't use TLS (Insecure)
-    Disable,
-    /// Try TLS, fall back to unencrypted if the server does not support TLS (Insecure)
+    /// accept any auth method provided by the server
     #[default]
-    Prefer,
-    /// Require TLS (Recommended)
-    Require,
+    Insecure,
+    /// verifies the server cert and the trust chain
+    Pki,
+    /// reject all auth methods except SCRAM-PLUS
+    ChannelBinding,
+    /// pki + channel binding
+    Hardened,
+}
+
+impl TlsMode {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Insecure,
+        Self::Pki,
+        Self::ChannelBinding,
+        Self::Hardened,
+    ];
+
+    pub(crate) fn requires_tls(self) -> bool {
+        self != Self::Insecure
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    pub(crate) fn requires_certificate_verification(self) -> bool {
+        matches!(self, Self::Pki | Self::Hardened)
+    }
+
+    pub(crate) fn requires_channel_binding(self) -> bool {
+        matches!(self, Self::ChannelBinding | Self::Hardened)
+    }
 }
 
 /// Connection options for PostgreSQL.
@@ -69,9 +93,7 @@ pub struct Opts {
     /// Default: `None`
     pub application_name: Option<String>,
 
-    /// TLS connection mode.
-    ///
-    /// Default: `TlsMode::Prefer`
+    /// Default: `TlsMode::Insecure`
     pub tls_mode: TlsMode,
 
     /// rustls client config for TLS connections.
@@ -156,7 +178,7 @@ impl Default for Opts {
             oauth_bearer_token_fn: None,
             oauth_discovery_fn: None,
             application_name: None,
-            tls_mode: TlsMode::Prefer,
+            tls_mode: TlsMode::Insecure,
             #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
             tls_config: None,
             params: Vec::new(),
@@ -180,7 +202,7 @@ impl TryFrom<&Url> for Opts {
     /// followed by two hex digits must be written as `%25`.
     ///
     /// Supported query parameters:
-    /// - `tls_mode`: disable, prefer, require
+    /// - `tls_mode`: insecure, pki, channel-binding, hardened
     /// - `application_name`: application name
     /// - `upgrade_to_unix_socket`: true/True/1/yes/on or false/False/0/no/off
     /// - `pool_max_idle_conn`: maximum idle connections (positive integer)
@@ -208,13 +230,14 @@ impl TryFrom<&Url> for Opts {
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "tls_mode" => {
-                    opts.tls_mode = match value.as_ref() {
-                        "disable" => TlsMode::Disable,
-                        "prefer" => TlsMode::Prefer,
-                        "require" => TlsMode::Require,
+                    opts.tls_mode = match value.to_ascii_lowercase().as_str() {
+                        "insecure" => TlsMode::Insecure,
+                        "pki" => TlsMode::Pki,
+                        "channel-binding" | "channelbinding" => TlsMode::ChannelBinding,
+                        "hardened" => TlsMode::Hardened,
                         _ => {
                             return Err(Error::InvalidUsage(format!(
-                                "Invalid tls_mode: expected one of ['disable', 'prefer', 'require'], got {}",
+                                "Invalid tls_mode: expected one of ['insecure', 'pki', 'channel-binding', 'hardened'], got {}",
                                 value
                             )));
                         }
@@ -382,5 +405,97 @@ mod tests {
         assert!(opts.password_fn.is_none());
         assert!(opts.oauth_bearer_token_fn.is_none());
         assert!(opts.oauth_discovery_fn.is_none());
+    }
+
+    #[test]
+    fn tls_mode_defaults_to_insecure() {
+        assert_eq!(TlsMode::default(), TlsMode::Insecure);
+        assert_eq!(Opts::default().tls_mode, TlsMode::Insecure);
+        assert_eq!(
+            Opts::try_from("postgres://alice@localhost/db")
+                .unwrap()
+                .tls_mode,
+            TlsMode::Insecure
+        );
+    }
+
+    #[test]
+    fn parses_tls_mode_from_url() {
+        for (value, expected) in [
+            ("insecure", TlsMode::Insecure),
+            ("pki", TlsMode::Pki),
+            ("channel-binding", TlsMode::ChannelBinding),
+            ("channelbinding", TlsMode::ChannelBinding),
+            ("hardened", TlsMode::Hardened),
+            ("Insecure", TlsMode::Insecure),
+            ("PKI", TlsMode::Pki),
+            ("Channel-Binding", TlsMode::ChannelBinding),
+            ("ChannelBinding", TlsMode::ChannelBinding),
+            ("CHANNELBINDING", TlsMode::ChannelBinding),
+            ("HARDENED", TlsMode::Hardened),
+        ] {
+            let opts =
+                Opts::try_from(format!("postgres://alice@localhost/db?tls_mode={value}").as_str())
+                    .unwrap();
+            assert_eq!(opts.tls_mode, expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn last_tls_mode_parameter_wins() {
+        let opts =
+            Opts::try_from("postgres://alice@localhost/db?tls_mode=hardened&tls_mode=insecure")
+                .unwrap();
+        assert_eq!(opts.tls_mode, TlsMode::Insecure);
+    }
+
+    #[test]
+    fn rejects_invalid_tls_mode() {
+        for value in [
+            "",
+            "secure_pki",
+            "secure_channel_binding",
+            "channel_binding",
+            "channel binding",
+            "channel--binding",
+            "require",
+            "prefer",
+            "disable",
+            "hardened%20",
+            "%00",
+        ] {
+            let err =
+                Opts::try_from(format!("postgres://alice@localhost/db?tls_mode={value}").as_str())
+                    .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidUsage(message) if message.contains("Invalid tls_mode")),
+                "{value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tls_mode_requires_tls() {
+        assert!(!TlsMode::Insecure.requires_tls());
+        assert!(TlsMode::Pki.requires_tls());
+        assert!(TlsMode::ChannelBinding.requires_tls());
+        assert!(TlsMode::Hardened.requires_tls());
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn tls_mode_requires_certificate_verification() {
+        assert!(!TlsMode::Insecure.requires_certificate_verification());
+        assert!(TlsMode::Pki.requires_certificate_verification());
+        assert!(!TlsMode::ChannelBinding.requires_certificate_verification());
+        assert!(TlsMode::Hardened.requires_certificate_verification());
+    }
+
+    #[test]
+    fn tls_mode_requires_channel_binding() {
+        assert!(!TlsMode::Insecure.requires_channel_binding());
+        assert!(!TlsMode::Pki.requires_channel_binding());
+        assert!(TlsMode::ChannelBinding.requires_channel_binding());
+        assert!(TlsMode::Hardened.requires_channel_binding());
     }
 }

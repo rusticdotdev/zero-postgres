@@ -10,15 +10,8 @@ use zero_postgres::sync::Pool;
 use zero_postgres::{Error, Opts};
 
 fn test_opts() -> Result<Opts, Error> {
-    let mut db_url = std::env::var("DATABASE_URL")
+    let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://localhost/postgres".to_string());
-    if !db_url.contains("tls_mode=") {
-        if db_url.contains('?') {
-            db_url.push_str("&tls_mode=disable");
-        } else {
-            db_url.push_str("?tls_mode=disable");
-        }
-    }
     Opts::try_from(db_url.as_str())
 }
 

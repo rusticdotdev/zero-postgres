@@ -311,12 +311,8 @@ fn derive_rejects_truncated_row() {
 // ─── #[derive(RefFromRow)] Against A Server ──────────────────────────────────
 
 fn get_conn() -> zero_postgres::Result<zero_postgres::sync::Conn> {
-    let mut db_url = std::env::var("DATABASE_URL")
+    let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://localhost/postgres".to_string());
-    if !db_url.contains("tls_mode=") {
-        db_url.push_str(if db_url.contains('?') { "&" } else { "?" });
-        db_url.push_str("tls_mode=disable");
-    }
     zero_postgres::sync::Conn::new(db_url.as_str())
 }
 
