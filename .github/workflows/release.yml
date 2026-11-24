@@ -30,6 +30,8 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        uses: ./.github/actions/install-deps
       - name: Run release-plz
         uses: rusticdotdev/release-plz/.github/actions/release-plz@ead71e9db8ee02b8cb31fedc47663a2578409daf # main
         env:
