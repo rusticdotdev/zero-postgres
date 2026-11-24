@@ -7,12 +7,15 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_platform_verifier::BuilderVerifierExt;
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use x509_cert::Certificate;
-use x509_cert::der::Decode;
+use x509_cert::der::oid::ObjectIdentifier;
 use x509_cert::der::oid::db::rfc5912::{
-    ECDSA_WITH_SHA_224, ECDSA_WITH_SHA_256, ECDSA_WITH_SHA_384, ECDSA_WITH_SHA_512,
+    ECDSA_WITH_SHA_224, ECDSA_WITH_SHA_256, ECDSA_WITH_SHA_384, ECDSA_WITH_SHA_512, ID_MD_5,
+    ID_MGF_1, ID_RSASSA_PSS, ID_SHA_1, ID_SHA_224, ID_SHA_256, ID_SHA_384, ID_SHA_512,
     MD_5_WITH_RSA_ENCRYPTION, SHA_1_WITH_RSA_ENCRYPTION, SHA_224_WITH_RSA_ENCRYPTION,
     SHA_256_WITH_RSA_ENCRYPTION, SHA_384_WITH_RSA_ENCRYPTION, SHA_512_WITH_RSA_ENCRYPTION,
 };
+use x509_cert::der::{Any, Decode, Reader, TagMode, TagNumber};
+use x509_cert::spki::AlgorithmIdentifierOwned;
 
 use crate::error::{Error, Result};
 use crate::opts::Opts;
@@ -119,26 +122,51 @@ pub fn server_name(host: &str) -> Result<ServerName<'static>> {
 }
 
 pub fn tls_server_end_point(certificate: &CertificateDer<'_>) -> Option<Vec<u8>> {
-    let signature_algorithm = Certificate::from_der(certificate)
-        .ok()?
-        .signature_algorithm()
-        .oid;
-    match signature_algorithm {
-        MD_5_WITH_RSA_ENCRYPTION
-        | SHA_1_WITH_RSA_ENCRYPTION
-        | SHA_256_WITH_RSA_ENCRYPTION
-        | ECDSA_WITH_SHA_256 => Some(Sha256::digest(certificate).to_vec()),
-        SHA_224_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_224 => {
-            Some(Sha224::digest(certificate).to_vec())
-        }
-        SHA_384_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_384 => {
-            Some(Sha384::digest(certificate).to_vec())
-        }
-        SHA_512_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_512 => {
-            Some(Sha512::digest(certificate).to_vec())
-        }
+    let parsed_certificate = Certificate::from_der(certificate).ok()?;
+    let signature_algorithm = parsed_certificate.signature_algorithm();
+    let hash_algorithm = match signature_algorithm.oid {
+        MD_5_WITH_RSA_ENCRYPTION => ID_MD_5,
+        SHA_1_WITH_RSA_ENCRYPTION => ID_SHA_1,
+        SHA_224_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_224 => ID_SHA_224,
+        SHA_256_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_256 => ID_SHA_256,
+        SHA_384_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_384 => ID_SHA_384,
+        SHA_512_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_512 => ID_SHA_512,
+        ID_RSASSA_PSS => rsassa_pss_hash_algorithm(signature_algorithm.parameters.as_ref()?)?,
+        _ => return None,
+    };
+    match hash_algorithm {
+        ID_MD_5 | ID_SHA_1 | ID_SHA_256 => Some(Sha256::digest(certificate).to_vec()),
+        ID_SHA_224 => Some(Sha224::digest(certificate).to_vec()),
+        ID_SHA_384 => Some(Sha384::digest(certificate).to_vec()),
+        ID_SHA_512 => Some(Sha512::digest(certificate).to_vec()),
         _ => None,
     }
+}
+
+fn rsassa_pss_hash_algorithm(parameters: &Any) -> Option<ObjectIdentifier> {
+    let (hash_algorithm, mask_gen_algorithm) = parameters
+        .sequence(|reader| {
+            let hash_algorithm = reader
+                .context_specific::<AlgorithmIdentifierOwned>(TagNumber(0), TagMode::Explicit)?;
+            let mask_gen_algorithm = reader
+                .context_specific::<AlgorithmIdentifierOwned>(TagNumber(1), TagMode::Explicit)?;
+            reader.read_slice(reader.remaining_len())?;
+            Ok::<_, x509_cert::der::Error>((hash_algorithm, mask_gen_algorithm))
+        })
+        .ok()?;
+    let hash_algorithm = hash_algorithm.map_or(ID_SHA_1, |algorithm| algorithm.oid);
+    let mask_gen_hash_algorithm = match mask_gen_algorithm {
+        Some(algorithm) if algorithm.oid == ID_MGF_1 => {
+            algorithm
+                .parameters?
+                .decode_as::<AlgorithmIdentifierOwned>()
+                .ok()?
+                .oid
+        }
+        Some(_) => return None,
+        None => ID_SHA_1,
+    };
+    (hash_algorithm == mask_gen_hash_algorithm).then_some(hash_algorithm)
 }
 
 #[cfg(test)]
@@ -163,6 +191,22 @@ pub(crate) mod tests {
 
     const RSA_SHA1_CERTIFICATE: &str = "MIIB9DCCAV2gAwIBAgIUHt+arhdme9FGK2jJBG+ubgoAdWcwDQYJKoZIhvcNAQEFBQAwDDEKMAgGA1UEAwwBdDAeFw0yNjExMjQxMjAyMjZaFw0zNjExMjExMjAyMjZaMAwxCjAIBgNVBAMMAXQwgZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBAN2CgxzffyEMf1HklxiErM3zAIQuLiSpUhdnr4NC99Btlp0oziXXUE0zlADp+t+ASKsQ51gU0wNhfM9kf2wkNLcvBqaN3MDaXr78NL9NrmxaV8JfdtMMPpnW/nK3hAchK8GtsuzH7YFCC/+LUiAoUZOAdCGd1bhD17RbigK4LnD1AgMBAAGjUzBRMB0GA1UdDgQWBBTtWZM7zFYMXuGnKLEWie0SN2flXjAfBgNVHSMEGDAWgBTtWZM7zFYMXuGnKLEWie0SN2flXjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBBQUAA4GBALWLbMdCZ8AS44qKZA1JvTjjGQM+uz2QbD8WTpin5fmOLouASrExn/ZVMGrjxGr3jhh6cYGT4ZblGEbgJ1FCOOHwhwVPuJB0RX4l0TfcQofm6AB56qokgDh4hmQTkbFv1KLY8tcsqaOsbYfHNA78lve2LaHXsjHXQAponVKhaZRF";
     const RSA_SHA1_END_POINT: &str = "Qv47MT4jLNH88nKB6NZ12QARNmv8lLn7OF8iVnIO3Eo=";
+
+    const RSA_PSS_SHA256_CERTIFICATE: &str = "MIICXDCCAZGgAwIBAgIUQ4sg8QNhlYeBS12rXsuumrdqqBgwQQYJKoZIhvcNAQEKMDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgEFAKIDAgEgMAwxCjAIBgNVBAMMAXQwHhcNMjYxMTI0MTY1NjIwWhcNMzYxMTIxMTY1NjIwWjAMMQowCAYDVQQDDAF0MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDILK/kWkzAmZRMbtMIJBrcKPxiedu1u478Axn/DScYdjYjUeyVorppdVdWzzc3/PK01WfmlmEQbBBgrYFP2ymCAxRzhMDDp3agQ3CAUwNhuwv+2hpH2MJGbtDHs8ve1IOkSJP5Dad7cL9+vUX6NfUUebKlXJFP7QChSLWCAq7KAQIDAQABo1MwUTAdBgNVHQ4EFgQU2xwnge2rLO8rtQk/kPynuXmOdaMwHwYDVR0jBBgwFoAU2xwnge2rLO8rtQk/kPynuXmOdaMwDwYDVR0TAQH/BAUwAwEB/zBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAQUAoRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAQUAogMCASADgYEAb8nsbXFJ+d2iOhbSY8goh8Jyw5QxmKRxsN/OcL4yRI3nVuMdufgxZbKarD0CQNVnAfiyW9Tm7ZI7KGHiLv13PjR3hq1VrQLutd2FXqryssK0Y5VHSmxP//ox9K/UOmTAygOc41B8MiM4t9evNqQwmEtxbBJ5z0BYXp1Js7TN+pA=";
+    const RSA_PSS_SHA256_END_POINT: &str = "X5YPg0TzrFDG9nGH+iH3FExV5nOpSmrPoR5v6T9um4g=";
+
+    const RSA_PSS_SHA384_CERTIFICATE: &str = "MIICXDCCAZGgAwIBAgIUeh0wupM7qppweWX217/T5AiZNV0wQQYJKoZIhvcNAQEKMDSgDzANBglghkgBZQMEAgIFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgIFAKIDAgEwMAwxCjAIBgNVBAMMAXQwHhcNMjYxMTI0MTY1NjIwWhcNMzYxMTIxMTY1NjIwWjAMMQowCAYDVQQDDAF0MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDILK/kWkzAmZRMbtMIJBrcKPxiedu1u478Axn/DScYdjYjUeyVorppdVdWzzc3/PK01WfmlmEQbBBgrYFP2ymCAxRzhMDDp3agQ3CAUwNhuwv+2hpH2MJGbtDHs8ve1IOkSJP5Dad7cL9+vUX6NfUUebKlXJFP7QChSLWCAq7KAQIDAQABo1MwUTAdBgNVHQ4EFgQU2xwnge2rLO8rtQk/kPynuXmOdaMwHwYDVR0jBBgwFoAU2xwnge2rLO8rtQk/kPynuXmOdaMwDwYDVR0TAQH/BAUwAwEB/zBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAgUAoRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAgUAogMCATADgYEAIhD1vcPpxiNw3R2TdbehzkRcJ3tlM5TJypc9j7ixUskgLzZGNOXy7JPOi9z1hr/3YR2dFzZPCW2232vkQmyrAYNRVCpDHRHkbNnlSUwHI8nFLfZHvpmqK8kbtoeLtcPUv1ow66z70v7WlfKyse1MoPOwINzcwZBbA5H5CpSybdk=";
+    const RSA_PSS_SHA384_END_POINT: &str =
+        "jdbd1xkTdINFfGTrR6jgqO4z+i+Aep2hzX8eiaSKVjj9A4/V5g9Ws4L6anqmbHWN";
+
+    const RSA_PSS_SHA512_CERTIFICATE: &str = "MIIDYTCCAhWgAwIBAgIUEjIrMo2XWXzRkIdKEazsCbKFVGswQQYJKoZIhvcNAQEKMDSgDzANBglghkgBZQMEAgMFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgMFAKIDAgFAMAwxCjAIBgNVBAMMAXQwHhcNMjYxMTI0MTY1NjM1WhcNMzYxMTIxMTY1NjM1WjAMMQowCAYDVQQDDAF0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzeml6lhbOW4zh4BFRDH1kQF1T/cLJw4LPhB1xz5KXWPzkfft9LRFtWTWZmBxJFamp6XMFJpC/Aajo/UvOROI9CLx8z97SAHchN9zK7sUvDynF17AGbdiEgQw2UvPvFM4mmiFtrW+pLwYeO7lCWvMwbhAbWXEgktPiZ2hhhptYf38fcL9GJYf92jxxcUCU9z6wwZ9Mjy8apkcz+ipMkrH3Lyn1kfJlkdoGm0XAaDETECjlj7mQ/ykpnrcq9nnNFrrVO/YqBr64xomZW1I7LbBphqOXMzFvr25VZxdyG0kykd2G7slCLIbAVrHPlHfwQAm9sslkwSxclWFgRNbPaAfaQIDAQABo1MwUTAdBgNVHQ4EFgQUAwkByZURZzSfqX16tfH8lNaAh44wHwYDVR0jBBgwFoAUAwkByZURZzSfqX16tfH8lNaAh44wDwYDVR0TAQH/BAUwAwEB/zBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAwUAoRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAwUAogMCAUADggEBAIeHsyUy7mShi44NRKtVHUUPo5rJ8Pp1CvytTXSx1EfeC4OyZaDBVhoRwpaQbsxA6ywXqfhqsSjiysuDVh0m8PWtHfbY8ki7T0YCm/3/8G8jAgemhLRm7H2ycaOsTjfV9VidjuYUkoM6EQXR3QPw/EAINEO0h+YFeXQfXySOOS3PIizsMM7xI+2HaeQJ6EM4q8SgTiJXUuKOAGNoykYXi82qaAPCdtHynSipsFvNxBFE93royldaFeMH/E/38NZZAzSRzLEthxfIYsin5WKqGr004i/Q+PCIO6VSS5H68J3h1+YlLJY2doVjhUsM/QUHWSk/Gm+VsZL5pBoVWY+yDkM=";
+    const RSA_PSS_SHA512_END_POINT: &str =
+        "flFY5bsfKy08V2/bTvSdWBNQRnFhJtV+gXxZESyZ1E7fNkwTWaVrQYiZuHP8im6AuY/fs+JdwVHaovVLntIyqQ==";
+
+    const RSA_PSS_SHA1_CERTIFICATE: &str = "MIIB9DCCAV2gAwIBAgIUbiK8AEUlAzpj3KnFOmF/h2iJSVowDQYJKoZIhvcNAQEKMAAwDDEKMAgGA1UEAwwBdDAeFw0yNjExMjQxNjU2MjBaFw0zNjExMjExNjU2MjBaMAwxCjAIBgNVBAMMAXQwgZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBAMgsr+RaTMCZlExu0wgkGtwo/GJ527W7jvwDGf8NJxh2NiNR7JWiuml1V1bPNzf88rTVZ+aWYRBsEGCtgU/bKYIDFHOEwMOndqBDcIBTA2G7C/7aGkfYwkZu0Mezy97Ug6RIk/kNp3twv369Rfo19RR5sqVckU/tAKFItYICrsoBAgMBAAGjUzBRMB0GA1UdDgQWBBTbHCeB7ass7yu1CT+Q/Ke5eY51ozAfBgNVHSMEGDAWgBTbHCeB7ass7yu1CT+Q/Ke5eY51ozAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCjAAA4GBACtYlCmZCCnhfoFhHVVLgMplVOzt7J9/WmBefaQeuRomZtrBFpmC8r2of4yKZb+3496kLT/4ybzNkECXGiKbznGak5Nz0ZWcsO2Y6j+UAzi+H318UYNbpjR8SkdghYe835/VpRGS4WoVJzoekPZ83ltNPHHi5BYw111N/1vlg/CN";
+    const RSA_PSS_SHA1_END_POINT: &str = "rKxqiskED/zEtafwna1Yf6EmvtCCc7A/aNKuJFEiHSc=";
+
+    const RSA_PSS_MIXED_HASH_CERTIFICATE: &str = "MIICXDCCAZGgAwIBAgIUSf0Eqyx4TOCVSmpHdFakmcsXS1owQQYJKoZIhvcNAQEKMDSgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgIFAKIDAgEgMAwxCjAIBgNVBAMMAXQwHhcNMjYxMTI0MTY1NjIwWhcNMzYxMTIxMTY1NjIwWjAMMQowCAYDVQQDDAF0MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDILK/kWkzAmZRMbtMIJBrcKPxiedu1u478Axn/DScYdjYjUeyVorppdVdWzzc3/PK01WfmlmEQbBBgrYFP2ymCAxRzhMDDp3agQ3CAUwNhuwv+2hpH2MJGbtDHs8ve1IOkSJP5Dad7cL9+vUX6NfUUebKlXJFP7QChSLWCAq7KAQIDAQABo1MwUTAdBgNVHQ4EFgQU2xwnge2rLO8rtQk/kPynuXmOdaMwHwYDVR0jBBgwFoAU2xwnge2rLO8rtQk/kPynuXmOdaMwDwYDVR0TAQH/BAUwAwEB/zBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAQUAoRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAgUAogMCASADgYEAieLp7GQ/Bb4zatBs3K+WQ7KsNZAYCwo10PU4Pm2OkozNwXWvOeTBoGHB/Cj+/yxYqln/H1Q4IboMEob2aufdXy1+44B98hwsnLK55kJjLfwE8U+dtw50kL7ZJr23tQaqLX6UQTUHg92KRUIXvZ9cg5YDAfcTES6dQO6OMvrge8g=";
 
     pub(crate) const ED25519_CERTIFICATE: &str = "MIIBLDCB36ADAgECAhQP41jlX5clwMzHyiXLxwDG9a7awTAFBgMrZXAwDDEKMAgGA1UEAwwBdDAeFw0yNjExMjQxMjAyMjZaFw0zNjExMjExMjAyMjZaMAwxCjAIBgNVBAMMAXQwKjAFBgMrZXADIQC9PCz1tfRaOXpWBjIcz6s5FGEykzOZGmXWVEMRH5Yza6NTMFEwHQYDVR0OBBYEFJCBKQpCDsK6JlYvrmPllhcep6cHMB8GA1UdIwQYMBaAFJCBKQpCDsK6JlYvrmPllhcep6cHMA8GA1UdEwEB/wQFMAMBAf8wBQYDK2VwA0EAnE9mLmQCfY4BlySSz/MafQ93G1o4VppD360iXX45jdYFjcx+r+PkI/UnFvBs2sZe4+a4McU+ZFzHz8f4D99IBQ==";
 
@@ -207,6 +251,39 @@ pub(crate) mod tests {
         let end_point = end_point_of(RSA_SHA1_CERTIFICATE).unwrap();
         assert_eq!(end_point.len(), 32);
         assert_eq!(end_point, decode(RSA_SHA1_END_POINT));
+    }
+
+    #[test]
+    fn rsa_pss_sha256_hashes_with_sha256() {
+        let end_point = end_point_of(RSA_PSS_SHA256_CERTIFICATE).unwrap();
+        assert_eq!(end_point.len(), 32);
+        assert_eq!(end_point, decode(RSA_PSS_SHA256_END_POINT));
+    }
+
+    #[test]
+    fn rsa_pss_sha384_hashes_with_sha384() {
+        let end_point = end_point_of(RSA_PSS_SHA384_CERTIFICATE).unwrap();
+        assert_eq!(end_point.len(), 48);
+        assert_eq!(end_point, decode(RSA_PSS_SHA384_END_POINT));
+    }
+
+    #[test]
+    fn rsa_pss_sha512_hashes_with_sha512() {
+        let end_point = end_point_of(RSA_PSS_SHA512_CERTIFICATE).unwrap();
+        assert_eq!(end_point.len(), 64);
+        assert_eq!(end_point, decode(RSA_PSS_SHA512_END_POINT));
+    }
+
+    #[test]
+    fn rsa_pss_default_sha1_upgrades_to_sha256() {
+        let end_point = end_point_of(RSA_PSS_SHA1_CERTIFICATE).unwrap();
+        assert_eq!(end_point.len(), 32);
+        assert_eq!(end_point, decode(RSA_PSS_SHA1_END_POINT));
+    }
+
+    #[test]
+    fn rsa_pss_mixed_hash_has_no_end_point() {
+        assert_eq!(end_point_of(RSA_PSS_MIXED_HASH_CERTIFICATE), None);
     }
 
     #[test]
