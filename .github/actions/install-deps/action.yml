@@ -1,0 +1,7 @@
+name: Install dependencies
+description: Install the libraries needed to build with all features
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libkrb5-dev libclang-dev pkg-config

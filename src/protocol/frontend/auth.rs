@@ -67,6 +67,12 @@ pub fn write_sasl_response(buf: &mut Vec<u8>, response: &[u8]) {
     msg.finish();
 }
 
+pub fn write_gss_response(buf: &mut Vec<u8>, token: &[u8]) {
+    let mut msg = MessageBuilder::new(buf, super::msg_type::PASSWORD);
+    msg.write_bytes(token);
+    msg.finish();
+}
+
 /// SCRAM-SHA-256 client implementation.
 pub struct ScramClient {
     /// Client nonce
@@ -299,5 +305,13 @@ mod tests {
         assert_eq!(buf[0], b'p');
         // Check that password is null-terminated in the message
         assert!(buf.ends_with(&[0]));
+    }
+
+    #[test]
+    fn gss_response_carries_token_verbatim() {
+        let mut buf = Vec::new();
+        write_gss_response(&mut buf, &[0x60, 0x00, 0xff]);
+
+        assert_eq!(buf, [b'p', 0, 0, 0, 7, 0x60, 0x00, 0xff]);
     }
 }

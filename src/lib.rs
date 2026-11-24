@@ -13,6 +13,8 @@
 mod buffer_pool;
 mod buffer_set;
 mod error;
+#[cfg(feature = "auth-gss")]
+mod gss;
 mod opts;
 mod pipeline;
 mod statement;

@@ -109,6 +109,11 @@ impl Conn {
                         ));
                     }
                 }
+                #[cfg(feature = "auth-gss")]
+                Action::GssStep => {
+                    let gss_step = state_machine.take_gss_step()?;
+                    state_machine.finish_gss_step(gss_step.run()?);
+                }
                 Action::HandleAsyncMessageAndReadMessage(_) => {
                     // Ignore async messages during startup, read next message
                     stream.read_message(&mut buffer_set)?;
@@ -361,6 +366,12 @@ impl Conn {
                 Action::TlsHandshake => {
                     return Err(Error::LibraryBug(
                         "Unexpected TlsHandshake in query state machine".into(),
+                    ));
+                }
+                #[cfg(feature = "auth-gss")]
+                Action::GssStep => {
+                    return Err(Error::LibraryBug(
+                        "Unexpected GssStep in query state machine".into(),
                     ));
                 }
                 Action::HandleAsyncMessageAndReadMessage(async_msg) => {

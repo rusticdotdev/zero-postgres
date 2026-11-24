@@ -117,6 +117,14 @@ impl Conn {
                         ));
                     }
                 }
+                #[cfg(feature = "auth-gss")]
+                Action::GssStep => {
+                    let gss_step = state_machine.take_gss_step()?;
+                    let gss_step = compio::runtime::spawn_blocking(move || gss_step.run())
+                        .await
+                        .map_err(|e| Error::LibraryBug(format!("GSS step task failed: {e}")))??;
+                    state_machine.finish_gss_step(gss_step);
+                }
                 Action::HandleAsyncMessageAndReadMessage(_) => {
                     // Ignore async messages during startup, read next message
                     stream.read_message(&mut buffer_set).await?;
@@ -353,6 +361,12 @@ impl Conn {
                 Action::TlsHandshake => {
                     return Err(Error::LibraryBug(
                         "Unexpected TlsHandshake in query state machine".into(),
+                    ));
+                }
+                #[cfg(feature = "auth-gss")]
+                Action::GssStep => {
+                    return Err(Error::LibraryBug(
+                        "Unexpected GssStep in query state machine".into(),
                     ));
                 }
                 Action::HandleAsyncMessageAndReadMessage(async_msg) => {

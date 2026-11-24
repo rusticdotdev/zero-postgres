@@ -3,12 +3,16 @@
 use std::borrow::Cow;
 
 use crate::error::{Error, Result};
+#[cfg(feature = "auth-gss")]
+use crate::gss::{GssClient, GssStep};
 use crate::opts::{Opts, TlsMode};
 use crate::protocol::backend::{
     AuthenticationMessage, BackendKeyData, ErrorResponse, NegotiateProtocolVersion,
     ParameterStatus, RawMessage, ReadyForQuery, msg_type,
 };
 use crate::protocol::frontend::auth::{ScramClient, md5_password};
+#[cfg(feature = "auth-gss")]
+use crate::protocol::frontend::write_gss_response;
 use crate::protocol::frontend::{
     startup::{PROTOCOL_VERSION_3_0, PROTOCOL_VERSION_3_2, write_ssl_request},
     write_password, write_sasl_initial_response, write_sasl_response, write_startup,
@@ -33,6 +37,14 @@ enum State {
     OauthInProgress,
     OauthFailedRead,
     OauthFailed,
+    #[cfg(feature = "auth-gss")]
+    GssStepPending,
+    #[cfg(feature = "auth-gss")]
+    GssStepFinished,
+    #[cfg(feature = "auth-gss")]
+    GssInProgressRead,
+    #[cfg(feature = "auth-gss")]
+    GssInProgress,
     WaitingAuthResultRead,
     WaitingAuthResult,
     WaitingReady,
@@ -47,6 +59,10 @@ pub struct ConnectionStateMachine {
     server_params: Vec<(String, String)>,
     transaction_status: TransactionStatus,
     scram_client: Option<ScramClient>,
+    #[cfg(feature = "auth-gss")]
+    gss_client: Option<GssClient>,
+    #[cfg(feature = "auth-gss")]
+    gss_step: Option<GssStep>,
     /// SSL response byte, set by driver after ReadByte
     ssl_response: u8,
     /// Whether the driver can perform a TLS handshake
@@ -65,6 +81,10 @@ impl ConnectionStateMachine {
             server_params: Vec::new(),
             transaction_status: TransactionStatus::Idle,
             scram_client: None,
+            #[cfg(feature = "auth-gss")]
+            gss_client: None,
+            #[cfg(feature = "auth-gss")]
+            gss_step: None,
             ssl_response: 0,
             tls_supported,
         }
@@ -249,34 +269,139 @@ impl ConnectionStateMachine {
                     return Ok(Action::Write);
                 }
 
-                // Check if SCRAM-SHA-256 is supported
-                if !mechanisms.contains(&"SCRAM-SHA-256") {
-                    return Err(Error::Auth(format!(
-                        "No supported SASL mechanism. Server offers: {:?}",
-                        mechanisms
-                    )));
+                if mechanisms.contains(&"SCRAM-SHA-256") {
+                    let password = self.required_password()?;
+
+                    let scram = ScramClient::new(&password);
+                    let client_first = scram.client_first_message();
+
+                    buffer_set.write_buffer.clear();
+                    write_sasl_initial_response(
+                        &mut buffer_set.write_buffer,
+                        "SCRAM-SHA-256",
+                        client_first.as_bytes(),
+                    );
+
+                    self.scram_client = Some(scram);
+                    self.state = State::SaslInProgressRead;
+                    return Ok(Action::Write);
                 }
 
-                let password = self.required_password()?;
-
-                let scram = ScramClient::new(&password);
-                let client_first = scram.client_first_message();
-
-                buffer_set.write_buffer.clear();
-                write_sasl_initial_response(
-                    &mut buffer_set.write_buffer,
-                    "SCRAM-SHA-256",
-                    client_first.as_bytes(),
-                );
-
-                self.scram_client = Some(scram);
-                self.state = State::SaslInProgressRead;
-                Ok(Action::Write)
+                Err(Error::Auth(format!(
+                    "No supported SASL mechanism. Server offers: {:?}",
+                    mechanisms
+                )))
+            }
+            #[cfg(feature = "auth-gss")]
+            AuthenticationMessage::Gss => {
+                let gss = GssClient::for_gss_request(self.gss_target_host()?)?;
+                Ok(self.request_gss_step(gss, None))
+            }
+            #[cfg(feature = "auth-gss")]
+            AuthenticationMessage::Sspi => {
+                let gss = GssClient::for_sspi_request(self.gss_target_host()?)?;
+                Ok(self.request_gss_step(gss, None))
             }
             _ => Err(Error::Unsupported(format!(
                 "Unsupported authentication method: {:?}",
                 auth
             ))),
+        }
+    }
+
+    #[cfg(feature = "auth-gss")]
+    fn gss_target_host(&self) -> Result<&str> {
+        if self.options.host.is_empty() {
+            return Err(Error::Auth(
+                "Host name required for GSS authentication".into(),
+            ));
+        }
+        Ok(&self.options.host)
+    }
+
+    #[cfg(feature = "auth-gss")]
+    fn request_gss_step(&mut self, gss: GssClient, server_token: Option<Vec<u8>>) -> Action {
+        self.gss_step = Some(GssStep::new(gss, server_token));
+        self.state = State::GssStepPending;
+        Action::GssStep
+    }
+
+    #[cfg(feature = "auth-gss")]
+    pub(crate) fn take_gss_step(&mut self) -> Result<GssStep> {
+        if self.state != State::GssStepPending {
+            return Err(Error::LibraryBug("No GSS step is pending".into()));
+        }
+        self.gss_step
+            .take()
+            .ok_or_else(|| Error::LibraryBug("GSS step already taken".into()))
+    }
+
+    #[cfg(feature = "auth-gss")]
+    pub(crate) fn finish_gss_step(&mut self, gss_step: GssStep) {
+        self.gss_step = Some(gss_step);
+        self.state = State::GssStepFinished;
+    }
+
+    #[cfg(feature = "auth-gss")]
+    fn handle_gss_step_finished(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
+        let GssStep {
+            client, response, ..
+        } = self
+            .gss_step
+            .take()
+            .ok_or_else(|| Error::LibraryBug("GSS step not finished".into()))?;
+        let complete = client.is_complete();
+        self.gss_client = Some(client);
+
+        match response {
+            Some(token) => {
+                buffer_set.write_buffer.clear();
+                write_gss_response(&mut buffer_set.write_buffer, &token);
+                self.state = State::GssInProgressRead;
+                Ok(Action::Write)
+            }
+            None if complete => {
+                self.state = State::GssInProgress;
+                Ok(Action::ReadMessage)
+            }
+            None => Err(Error::Auth(
+                "GSS context is incomplete but produced no token".into(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "auth-gss")]
+    fn handle_gss_message(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
+        let type_byte = buffer_set.type_byte;
+        if type_byte != msg_type::AUTHENTICATION {
+            return Err(Error::LibraryBug(format!(
+                "Expected Authentication message, got '{}'",
+                type_byte as char
+            )));
+        }
+
+        let auth = AuthenticationMessage::parse(&buffer_set.read_buffer)?;
+
+        match auth {
+            AuthenticationMessage::Ok => {
+                let complete = self.gss_client.as_ref().is_some_and(GssClient::is_complete);
+                if !complete {
+                    return Err(Error::Auth(
+                        "Server accepted authentication before the GSS context was established"
+                            .into(),
+                    ));
+                }
+                self.state = State::WaitingReady;
+                Ok(Action::ReadMessage)
+            }
+            AuthenticationMessage::GssContinue { data } => {
+                let gss = self
+                    .gss_client
+                    .take()
+                    .ok_or_else(|| Error::LibraryBug("GSS client not initialized".into()))?;
+                Ok(self.request_gss_step(gss, Some(data.to_vec())))
+            }
+            _ => Err(Error::Auth(format!("Unexpected GSS message: {:?}", auth))),
         }
     }
 
@@ -477,6 +602,19 @@ impl StateMachine for ConnectionStateMachine {
                 self.state = State::OauthFailed;
                 return Ok(Action::ReadMessage);
             }
+            #[cfg(feature = "auth-gss")]
+            State::GssStepPending => {
+                return Err(Error::LibraryBug(
+                    "step() called before the GSS step finished".into(),
+                ));
+            }
+            #[cfg(feature = "auth-gss")]
+            State::GssStepFinished => return self.handle_gss_step_finished(buffer_set),
+            #[cfg(feature = "auth-gss")]
+            State::GssInProgressRead => {
+                self.state = State::GssInProgress;
+                return Ok(Action::ReadMessage);
+            }
             State::WaitingAuthResultRead => {
                 self.state = State::WaitingAuthResult;
                 return Ok(Action::ReadMessage);
@@ -509,6 +647,8 @@ impl StateMachine for ConnectionStateMachine {
                 "Expected ErrorResponse after OAUTHBEARER failure, got '{}'",
                 type_byte as char
             ))),
+            #[cfg(feature = "auth-gss")]
+            State::GssInProgress => self.handle_gss_message(buffer_set),
             State::WaitingAuthResult => self.handle_auth_result(buffer_set),
             State::WaitingReady => self.handle_ready_message(buffer_set),
             _ => Err(Error::LibraryBug(format!(
@@ -875,6 +1015,75 @@ mod tests {
                 matches!(&err, Error::Auth(message) if message.contains("Password required")),
                 "{err}"
             );
+        }
+    }
+
+    #[cfg(not(feature = "auth-gss"))]
+    #[test]
+    fn gss_and_sspi_unsupported_without_auth_gss() {
+        for code in [7, 9] {
+            let mut machine = auth_machine(Opts::default());
+            let mut buffer_set = BufferSet::new();
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(code, &[]),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{err}");
+            assert!(buffer_set.write_buffer.is_empty());
+        }
+    }
+
+    #[cfg(feature = "auth-gss")]
+    #[test]
+    fn gss_and_sspi_require_host() {
+        for code in [7, 9] {
+            let mut machine = auth_machine(Opts::default());
+            let mut buffer_set = BufferSet::new();
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(code, &[]),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::Auth(message) if message.contains("Host name required")),
+                "{err}"
+            );
+            assert!(buffer_set.write_buffer.is_empty());
+            assert!(machine.gss_client.is_none());
+        }
+    }
+
+    #[cfg(feature = "auth-gss")]
+    #[test]
+    fn gss_and_sspi_hand_token_creation_to_driver() {
+        for code in [7, 9] {
+            let options = Opts {
+                host: "db.example.test".into(),
+                ..Opts::default()
+            };
+            let mut machine = auth_machine(options);
+            let mut buffer_set = BufferSet::new();
+            let action = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(code, &[]),
+            )
+            .unwrap();
+            assert!(matches!(action, Action::GssStep), "{action:?}");
+            assert!(buffer_set.write_buffer.is_empty());
+
+            let err = machine.step(&mut buffer_set).unwrap_err();
+            assert!(matches!(err, Error::LibraryBug(_)), "{err}");
+
+            let gss_step = machine.take_gss_step().unwrap();
+            assert!(gss_step.server_token.is_none());
+            assert!(machine.take_gss_step().is_err());
         }
     }
 
