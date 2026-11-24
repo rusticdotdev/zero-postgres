@@ -38,6 +38,9 @@ pub enum Action {
     /// After successful handshake, call `step()` again.
     TlsHandshake,
 
+    #[cfg(feature = "auth-gss")]
+    GssStep,
+
     /// An asynchronous message was received.
     ///
     /// The caller should handle the message, read the next message,

@@ -6,7 +6,9 @@ pub mod extended;
 pub mod simple;
 pub mod startup;
 
-pub use auth::{write_password, write_sasl_initial_response, write_sasl_response};
+pub use auth::{
+    write_gss_response, write_password, write_sasl_initial_response, write_sasl_response,
+};
 pub use copy::{write_copy_data, write_copy_done, write_copy_fail};
 // Re-export shared copy types for convenience
 pub use super::copy::{CopyData, CopyDone};
