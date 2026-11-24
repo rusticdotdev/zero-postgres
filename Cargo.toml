@@ -20,15 +20,15 @@ default = ["sync", "tokio", "derive"]
 derive = ["dep:zero-postgres-derive"]
 sync = []
 tokio = ["dep:tokio", "tokio/io-util", "tokio/net", "tokio/rt"]
-sync-tls = ["dep:rustls", "dep:rustls-platform-verifier"]
-tokio-tls = ["dep:rustls", "dep:rustls-platform-verifier", "dep:tokio-rustls"]
+sync-tls = ["dep:rustls", "dep:rustls-platform-verifier", "dep:x509-cert"]
+tokio-tls = ["dep:rustls", "dep:rustls-platform-verifier", "dep:tokio-rustls", "dep:x509-cert"]
 with-uuid = ["dep:uuid"]
 with-time = ["dep:time"]
 with-jiff = ["dep:jiff"]
 with-rust-decimal = ["dep:rust_decimal"]
 lowlevel = []
 compio = ["dep:compio", "dep:tokio"]
-compio-tls = ["compio/rustls", "dep:rustls", "dep:rustls-platform-verifier"]
+compio-tls = ["compio/rustls", "dep:futures-rustls", "dep:rustls", "dep:rustls-platform-verifier", "dep:x509-cert"]
 diesel = ["dep:diesel", "sync"]
 auth-gss = ["dep:libgssapi", "dep:windows-sys"]
 
@@ -71,6 +71,8 @@ diesel = { version = "2.3", features = [
   "postgres_backend",
   "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
 ], optional = true }
+x509-cert = { version = "0.3", default-features = false, optional = true }
+futures-rustls = { version = "0.26", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

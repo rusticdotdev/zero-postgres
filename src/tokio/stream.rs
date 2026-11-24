@@ -54,6 +54,19 @@ impl Stream {
         }
     }
 
+    #[cfg(feature = "tokio-tls")]
+    pub fn server_certificate_der(&self) -> Option<Vec<u8>> {
+        match self {
+            Stream::Tls(buf_reader) => {
+                let (_, connection) = buf_reader.get_ref().get_ref();
+                Some(connection.peer_certificates()?.first()?.to_vec())
+            }
+            Stream::Tcp(_) => None,
+            #[cfg(unix)]
+            Stream::Unix(_) => None,
+        }
+    }
+
     pub async fn read_u8(&mut self) -> std::io::Result<u8> {
         match self {
             Stream::Tcp(r) => r.read_u8().await,

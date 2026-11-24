@@ -67,6 +67,7 @@ pub struct ConnectionStateMachine {
     ssl_response: u8,
     /// Whether the driver can perform a TLS handshake
     tls_supported: bool,
+    server_certificate_der: Option<Vec<u8>>,
 }
 
 impl ConnectionStateMachine {
@@ -87,6 +88,25 @@ impl ConnectionStateMachine {
             gss_step: None,
             ssl_response: 0,
             tls_supported,
+            server_certificate_der: None,
+        }
+    }
+
+    pub fn set_server_certificate_der(&mut self, server_certificate_der: Vec<u8>) {
+        self.server_certificate_der = Some(server_certificate_der);
+    }
+
+    fn tls_server_end_point(&self) -> Option<Vec<u8>> {
+        #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+        {
+            let server_certificate_der = self.server_certificate_der.as_deref()?;
+            crate::tls::tls_server_end_point(&rustls::pki_types::CertificateDer::from(
+                server_certificate_der,
+            ))
+        }
+        #[cfg(not(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls")))]
+        {
+            None
         }
     }
 
@@ -187,6 +207,24 @@ impl ConnectionStateMachine {
             .ok_or_else(|| Error::Auth("Password required but not provided".into()))
     }
 
+    fn start_scram(
+        &mut self,
+        mechanism: &str,
+        scram: ScramClient,
+        buffer_set: &mut BufferSet,
+    ) -> Action {
+        buffer_set.write_buffer.clear();
+        write_sasl_initial_response(
+            &mut buffer_set.write_buffer,
+            mechanism,
+            scram.client_first_message().as_bytes(),
+        );
+
+        self.scram_client = Some(scram);
+        self.state = State::SaslInProgressRead;
+        Action::Write
+    }
+
     fn handle_auth_message(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
         let type_byte = buffer_set.type_byte;
 
@@ -244,6 +282,27 @@ impl ConnectionStateMachine {
                 Ok(Action::Write)
             }
             AuthenticationMessage::Sasl { mechanisms } => {
+                let tls_server_end_point = self.tls_server_end_point();
+
+                if let Some(channel_binding_data) = &tls_server_end_point
+                    && mechanisms.contains(&"SCRAM-SHA-256-PLUS")
+                {
+                    let password = self.required_password()?;
+                    let scram =
+                        ScramClient::new_with_channel_binding(&password, channel_binding_data);
+                    return Ok(self.start_scram("SCRAM-SHA-256-PLUS", scram, buffer_set));
+                }
+
+                if mechanisms.contains(&"SCRAM-SHA-256") {
+                    let password = self.required_password()?;
+                    let scram = if tls_server_end_point.is_some() {
+                        ScramClient::new_with_unadvertised_channel_binding(&password)
+                    } else {
+                        ScramClient::new(&password)
+                    };
+                    return Ok(self.start_scram("SCRAM-SHA-256", scram, buffer_set));
+                }
+
                 if mechanisms.contains(&"OAUTHBEARER") {
                     let initial_response = match &self.options.oauth_bearer_token_fn {
                         Some(oauth_bearer_token_fn) => {
@@ -266,24 +325,6 @@ impl ConnectionStateMachine {
                         initial_response.as_bytes(),
                     );
                     self.state = State::OauthInProgressRead;
-                    return Ok(Action::Write);
-                }
-
-                if mechanisms.contains(&"SCRAM-SHA-256") {
-                    let password = self.required_password()?;
-
-                    let scram = ScramClient::new(&password);
-                    let client_first = scram.client_first_message();
-
-                    buffer_set.write_buffer.clear();
-                    write_sasl_initial_response(
-                        &mut buffer_set.write_buffer,
-                        "SCRAM-SHA-256",
-                        client_first.as_bytes(),
-                    );
-
-                    self.scram_client = Some(scram);
-                    self.state = State::SaslInProgressRead;
                     return Ok(Action::Write);
                 }
 
@@ -1476,5 +1517,187 @@ mod tests {
         assert!(machine.scram_client.is_some());
         assert!(buffer_set.write_buffer[5..].starts_with(b"SCRAM-SHA-256\0"));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    fn decode_base64(encoded: &str) -> Vec<u8> {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap()
+    }
+
+    fn start_sasl(
+        encoded_certificate: Option<&str>,
+        mechanisms: &[&str],
+    ) -> (ConnectionStateMachine, BufferSet) {
+        let options = Opts {
+            password: Some("secret".into()),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        if let Some(encoded_certificate) = encoded_certificate {
+            machine.set_server_certificate_der(decode_base64(encoded_certificate));
+        }
+        let mut buffer_set = BufferSet::new();
+        let action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(mechanisms),
+        );
+        assert!(matches!(action, Ok(Action::Write)));
+        assert_eq!(machine.state, State::SaslInProgressRead);
+        assert!(machine.scram_client.is_some());
+        (machine, buffer_set)
+    }
+
+    fn sasl_initial_response(write_buffer: &[u8]) -> (String, String) {
+        let (header, body) = write_buffer.split_at(5);
+        assert_eq!(header[0], b'p');
+        let message_length = i32::from_be_bytes(header[1..].try_into().unwrap());
+        assert_eq!(message_length as usize, write_buffer.len() - 1);
+        let mechanism_end = body.iter().position(|&byte| byte == 0).unwrap();
+        let mechanism = std::str::from_utf8(&body[..mechanism_end]).unwrap();
+        let rest = &body[mechanism_end + 1..];
+        let response_length = i32::from_be_bytes(rest[..4].try_into().unwrap());
+        let client_first = std::str::from_utf8(&rest[4..]).unwrap();
+        assert_eq!(response_length as usize, client_first.len());
+        (mechanism.to_string(), client_first.to_string())
+    }
+
+    #[test]
+    fn sasl_without_server_certificate_uses_scram_without_channel_binding() {
+        for mechanisms in [
+            &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"][..],
+            &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"],
+            &["SCRAM-SHA-256"],
+        ] {
+            let (_, buffer_set) = start_sasl(None, mechanisms);
+            let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+            assert_eq!(mechanism, "SCRAM-SHA-256");
+            assert!(client_first.starts_with("n,,n=,r="), "{client_first}");
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn sasl_with_server_certificate_prefers_scram_plus() {
+        use crate::tls::tests::ECDSA_SHA256_CERTIFICATE;
+
+        for mechanisms in [
+            &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"][..],
+            &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"],
+            &["SCRAM-SHA-256-PLUS"],
+        ] {
+            let (_, buffer_set) = start_sasl(Some(ECDSA_SHA256_CERTIFICATE), mechanisms);
+            let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+            assert_eq!(mechanism, "SCRAM-SHA-256-PLUS");
+            assert!(
+                client_first.starts_with("p=tls-server-end-point,,n=,r="),
+                "{client_first}"
+            );
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn sasl_with_server_certificate_without_plus_offered_uses_unadvertised_channel_binding() {
+        use crate::tls::tests::ECDSA_SHA256_CERTIFICATE;
+
+        let (_, buffer_set) = start_sasl(Some(ECDSA_SHA256_CERTIFICATE), &["SCRAM-SHA-256"]);
+        let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+        assert_eq!(mechanism, "SCRAM-SHA-256");
+        assert!(client_first.starts_with("y,,n=,r="), "{client_first}");
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn sasl_with_unhashable_server_certificate_uses_scram_without_channel_binding() {
+        use crate::tls::tests::ED25519_CERTIFICATE;
+
+        for encoded_certificate in [ED25519_CERTIFICATE, "bm90IGEgY2VydGlmaWNhdGU="] {
+            let (_, buffer_set) = start_sasl(
+                Some(encoded_certificate),
+                &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
+            );
+            let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+            assert_eq!(mechanism, "SCRAM-SHA-256");
+            assert!(client_first.starts_with("n,,n=,r="), "{client_first}");
+        }
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn sasl_with_unhashable_server_certificate_rejects_plus_only() {
+        use crate::tls::tests::ED25519_CERTIFICATE;
+
+        let options = Opts {
+            password: Some("secret".into()),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(options);
+        machine.set_server_certificate_der(decode_base64(ED25519_CERTIFICATE));
+        let mut buffer_set = BufferSet::new();
+        let err = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["SCRAM-SHA-256-PLUS"]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Auth(message) if message.contains("No supported SASL mechanism")),
+            "{err}"
+        );
+        assert!(buffer_set.write_buffer.is_empty());
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    #[test]
+    fn sasl_plus_client_final_binds_server_end_point() {
+        use crate::tls::tests::{ECDSA_SHA256_CERTIFICATE, ECDSA_SHA256_END_POINT};
+
+        let (mut machine, mut buffer_set) = start_sasl(
+            Some(ECDSA_SHA256_CERTIFICATE),
+            &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
+        );
+        let (_, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+        let client_nonce = client_first
+            .strip_prefix("p=tls-server-end-point,,n=,r=")
+            .unwrap();
+
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::ReadMessage)
+        ));
+        assert_eq!(machine.state, State::SaslInProgress);
+
+        let server_first = format!("r={client_nonce}server,s=c2FsdA==,i=4096");
+        let action = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(11, server_first.as_bytes()),
+        );
+        assert!(matches!(action, Ok(Action::Write)));
+        assert_eq!(machine.state, State::SaslInProgressRead);
+
+        assert_eq!(buffer_set.write_buffer[0], b'p');
+        let client_final = std::str::from_utf8(&buffer_set.write_buffer[5..]).unwrap();
+        let channel_binding = client_final
+            .split(',')
+            .next()
+            .unwrap()
+            .strip_prefix("c=")
+            .unwrap();
+        assert_eq!(
+            decode_base64(channel_binding),
+            [
+                b"p=tls-server-end-point,,".as_slice(),
+                &decode_base64(ECDSA_SHA256_END_POINT)
+            ]
+            .concat()
+        );
+        assert!(
+            client_final.contains(&format!(",r={client_nonce}server,p=")),
+            "{client_final}"
+        );
     }
 }

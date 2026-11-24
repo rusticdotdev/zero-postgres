@@ -109,6 +109,9 @@ impl Conn {
                     {
                         let config = crate::tls::client_config(&options)?;
                         stream = stream.upgrade_to_tls(&options.host, config).await?;
+                        if let Some(server_certificate_der) = stream.server_certificate_der() {
+                            state_machine.set_server_certificate_der(server_certificate_der);
+                        }
                     }
                     #[cfg(not(feature = "compio-tls"))]
                     {

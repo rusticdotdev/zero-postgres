@@ -58,6 +58,23 @@ impl Stream {
         }
     }
 
+    #[cfg(feature = "sync-tls")]
+    pub fn server_certificate_der(&self) -> Option<Vec<u8>> {
+        match self {
+            Stream::Tls(buf_reader) => Some(
+                buf_reader
+                    .get_ref()
+                    .conn
+                    .peer_certificates()?
+                    .first()?
+                    .to_vec(),
+            ),
+            Stream::Tcp(_) => None,
+            #[cfg(unix)]
+            Stream::Unix(_) => None,
+        }
+    }
+
     pub fn read_u8(&mut self) -> std::io::Result<u8> {
         let mut buf = [0u8; 1];
         let n = match self {

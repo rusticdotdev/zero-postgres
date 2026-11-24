@@ -30,6 +30,8 @@ pub struct Stream {
     inner: StreamInner,
     read_buf: Vec<u8>,
     read_pos: usize,
+    #[cfg(feature = "compio-tls")]
+    server_certificate_der: Option<Vec<u8>>,
 }
 
 impl Stream {
@@ -38,6 +40,8 @@ impl Stream {
             inner: StreamInner::Tcp(stream),
             read_buf: Vec::with_capacity(READ_BUF_CAPACITY),
             read_pos: 0,
+            #[cfg(feature = "compio-tls")]
+            server_certificate_der: None,
         }
     }
 
@@ -47,6 +51,8 @@ impl Stream {
             inner: StreamInner::Unix(stream),
             read_buf: Vec::with_capacity(READ_BUF_CAPACITY),
             read_pos: 0,
+            #[cfg(feature = "compio-tls")]
+            server_certificate_der: None,
         }
     }
 
@@ -61,14 +67,25 @@ impl Stream {
     ) -> Result<Self, crate::error::Error> {
         match self.inner {
             StreamInner::Tcp(tcp_stream) => {
-                let connector = compio::tls::TlsConnector::from(config);
-                let tls_stream = connector.connect(host, tcp_stream).await?;
+                let connector = futures_rustls::TlsConnector::from(config);
+                let tls_stream = connector
+                    .connect(
+                        crate::tls::server_name(host)?,
+                        Box::pin(compio::io::compat::AsyncStream::new(tcp_stream)),
+                    )
+                    .await?;
+                let (_, connection) = tls_stream.get_ref();
+                let server_certificate_der = connection
+                    .peer_certificates()
+                    .and_then(|certificates| certificates.first())
+                    .map(|certificate| certificate.to_vec());
                 // Start with a fresh read buffer after TLS handshake;
                 // any pre-TLS buffered bytes are invalid in the TLS context.
                 Ok(Self {
-                    inner: StreamInner::Tls(Box::new(tls_stream)),
+                    inner: StreamInner::Tls(Box::new(TlsStream::from(tls_stream))),
                     read_buf: Vec::with_capacity(READ_BUF_CAPACITY),
                     read_pos: 0,
+                    server_certificate_der,
                 })
             }
             StreamInner::Tls(_) => Err(crate::error::Error::InvalidUsage(
@@ -79,6 +96,11 @@ impl Stream {
                 "Cannot upgrade Unix socket to TLS".into(),
             )),
         }
+    }
+
+    #[cfg(feature = "compio-tls")]
+    pub fn server_certificate_der(&self) -> Option<Vec<u8>> {
+        self.server_certificate_der.clone()
     }
 
     // --- Buffered read internals ---

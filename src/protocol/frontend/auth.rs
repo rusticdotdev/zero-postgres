@@ -77,8 +77,8 @@ pub fn write_gss_response(buf: &mut Vec<u8>, token: &[u8]) {
 pub struct ScramClient {
     /// Client nonce
     nonce: String,
-    /// Channel binding flag
-    channel_binding: String,
+    gs2_header: &'static str,
+    channel_binding_data: Vec<u8>,
     /// Password
     password: String,
     /// Server-first-message (stored for later)
@@ -92,6 +92,23 @@ pub struct ScramClient {
 impl ScramClient {
     /// Create a new SCRAM client.
     pub fn new(password: &str) -> Self {
+        Self::with_gs2_header(password, "n,,", &[])
+    }
+
+    /// Create a new SCRAM client with channel binding.
+    pub fn new_with_channel_binding(password: &str, channel_binding_data: &[u8]) -> Self {
+        Self::with_gs2_header(password, "p=tls-server-end-point,,", channel_binding_data)
+    }
+
+    pub fn new_with_unadvertised_channel_binding(password: &str) -> Self {
+        Self::with_gs2_header(password, "y,,", &[])
+    }
+
+    fn with_gs2_header(
+        password: &str,
+        gs2_header: &'static str,
+        channel_binding_data: &[u8],
+    ) -> Self {
         use rand::RngExt;
 
         // Generate 24-byte random nonce, base64 encoded
@@ -101,31 +118,8 @@ impl ScramClient {
 
         Self {
             nonce,
-            channel_binding: "n,,".to_string(), // No channel binding
-            password: password.to_string(),
-            server_first: None,
-            auth_message: None,
-            salted_password: None,
-        }
-    }
-
-    /// Create a new SCRAM client with channel binding.
-    pub fn new_with_channel_binding(password: &str, channel_binding_data: &[u8]) -> Self {
-        use rand::RngExt;
-
-        let mut nonce_bytes = [0u8; 24];
-        rand::rng().fill(&mut nonce_bytes);
-        let nonce = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
-
-        // p=tls-server-end-point,,
-        let cb_data = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            channel_binding_data,
-        );
-
-        Self {
-            nonce,
-            channel_binding: format!("p=tls-server-end-point,,{}", cb_data),
+            gs2_header,
+            channel_binding_data: channel_binding_data.to_vec(),
             password: password.to_string(),
             server_first: None,
             auth_message: None,
@@ -137,7 +131,7 @@ impl ScramClient {
     pub fn client_first_message(&self) -> String {
         // n,,n=,r=<nonce>
         // Note: username is empty because PostgreSQL ignores it in SCRAM
-        format!("{}n=,r={}", self.channel_binding, self.nonce)
+        format!("{}n=,r={}", self.gs2_header, self.nonce)
     }
 
     /// Get the bare client-first-message (without channel binding prefix).
@@ -205,9 +199,8 @@ impl ScramClient {
         // StoredKey = H(ClientKey)
         let stored_key = Sha256::digest(client_key);
 
-        // channel-binding = base64(channel-binding-flag)
-        let channel_binding_b64 =
-            base64::engine::general_purpose::STANDARD.encode(self.channel_binding.as_bytes());
+        let channel_binding_b64 = base64::engine::general_purpose::STANDARD
+            .encode([self.gs2_header.as_bytes(), &self.channel_binding_data].concat());
 
         // client-final-message-without-proof = c=<channel-binding>,r=<nonce>
         let client_final_without_proof = format!("c={},r={}", channel_binding_b64, combined_nonce);
@@ -313,5 +306,121 @@ mod tests {
         write_gss_response(&mut buf, &[0x60, 0x00, 0xff]);
 
         assert_eq!(buf, [b'p', 0, 0, 0, 7, 0x60, 0x00, 0xff]);
+    }
+
+    fn encode(bytes: &[u8]) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+    }
+
+    fn channel_binding_attribute(scram: &mut ScramClient) -> String {
+        let server_first = format!("r={}server,s={},i=4096", scram.nonce, encode(b"salt"));
+        let client_final = scram.process_server_first(&server_first).unwrap();
+        let channel_binding = client_final
+            .split(',')
+            .next()
+            .unwrap()
+            .strip_prefix("c=")
+            .unwrap();
+        channel_binding.to_string()
+    }
+
+    #[test]
+    fn client_first_message_starts_with_gs2_header() {
+        let channel_binding_data: Vec<u8> = (0..=255).collect();
+        for (scram, header) in [
+            (ScramClient::new("secret"), "n,,"),
+            (
+                ScramClient::new_with_unadvertised_channel_binding("secret"),
+                "y,,",
+            ),
+            (
+                ScramClient::new_with_channel_binding("secret", &channel_binding_data),
+                "p=tls-server-end-point,,",
+            ),
+        ] {
+            assert_eq!(
+                scram.client_first_message(),
+                format!("{header}n=,r={}", scram.nonce)
+            );
+            assert!(
+                !scram
+                    .client_first_message()
+                    .contains(&encode(&channel_binding_data))
+            );
+        }
+    }
+
+    #[test]
+    fn client_final_channel_binding_without_binding_data() {
+        assert_eq!(
+            channel_binding_attribute(&mut ScramClient::new("secret")),
+            "biws"
+        );
+        assert_eq!(
+            channel_binding_attribute(&mut ScramClient::new_with_unadvertised_channel_binding(
+                "secret"
+            )),
+            "eSws"
+        );
+    }
+
+    #[test]
+    fn client_final_channel_binding_carries_raw_binding_data() {
+        for channel_binding_data in [
+            vec![0xab; 32],
+            vec![0x00, 0xff, 0xfe, 0x80, 0x00],
+            (0..=255).collect::<Vec<u8>>(),
+        ] {
+            let mut scram = ScramClient::new_with_channel_binding("secret", &channel_binding_data);
+            let expected = encode(
+                &[
+                    b"p=tls-server-end-point,,".as_slice(),
+                    &channel_binding_data,
+                ]
+                .concat(),
+            );
+            assert_eq!(channel_binding_attribute(&mut scram), expected);
+        }
+    }
+
+    #[test]
+    fn channel_binding_known_answer() {
+        let channel_binding_data: Vec<u8> = (0..32).collect();
+        let mut scram = ScramClient::new_with_channel_binding("pencil", &channel_binding_data);
+        scram.nonce = "rOprNGfwEbeRWgbNEkqO".to_string();
+        assert_eq!(
+            scram.client_first_message(),
+            "p=tls-server-end-point,,n=,r=rOprNGfwEbeRWgbNEkqO"
+        );
+
+        let client_final = scram
+            .process_server_first(
+                "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+            )
+            .unwrap();
+        assert_eq!(
+            client_final,
+            "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=Q8h71kjaoMzNI7dPksDrhRE/5mTUObF0fUHVIgBOWQg="
+        );
+
+        scram
+            .verify_server_final("v=ykwoqH8mLqO5AQCeuwwf6lsj9f8zyJZT/CcvAbN4Ssc=")
+            .unwrap();
+        scram
+            .verify_server_final("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+            .unwrap_err();
+    }
+
+    #[test]
+    fn channel_binding_data_changes_client_proof() {
+        let server_first = "r=fixednonceserver,s=c2FsdA==,i=4096";
+        let mut proofs = Vec::new();
+        for channel_binding_data in [[0u8; 32], [1u8; 32]] {
+            let mut scram = ScramClient::new_with_channel_binding("secret", &channel_binding_data);
+            scram.nonce = "fixednonce".to_string();
+            let client_final = scram.process_server_first(server_first).unwrap();
+            proofs.push(client_final.rsplit_once(",p=").unwrap().1.to_string());
+        }
+        assert_ne!(proofs[0], proofs[1]);
     }
 }
