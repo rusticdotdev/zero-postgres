@@ -2,6 +2,9 @@
 
 use crate::protocol::codec::MessageBuilder;
 
+const MIN_SCRAM_ITERATIONS: u32 = 4096;
+const MAX_SCRAM_ITERATIONS: u32 = 10_000_000;
+
 /// Write a PasswordMessage (cleartext or MD5 hashed password).
 pub fn write_password(buf: &mut Vec<u8>, password: &str) {
     let mut msg = MessageBuilder::new(buf, super::msg_type::PASSWORD);
@@ -161,6 +164,17 @@ impl ScramClient {
         let combined_nonce = combined_nonce.ok_or("Missing nonce in server-first-message")?;
         let salt_b64 = salt_b64.ok_or("Missing salt in server-first-message")?;
         let iterations: u32 = iterations.ok_or("Missing iterations in server-first-message")?;
+        if iterations < MIN_SCRAM_ITERATIONS {
+            return Err(format!(
+                "SCRAM iteration count {iterations} is below the minimum of {MIN_SCRAM_ITERATIONS}"
+            ));
+        }
+        // Prevent DoS
+        if iterations > MAX_SCRAM_ITERATIONS {
+            return Err(format!(
+                "SCRAM iteration count {iterations} exceeds the maximum of {MAX_SCRAM_ITERATIONS}"
+            ));
+        }
 
         // Verify nonce starts with our client nonce
         if !combined_nonce.starts_with(&self.nonce) {
@@ -416,5 +430,67 @@ mod tests {
             proofs.push(client_final.rsplit_once(",p=").unwrap().1.to_string());
         }
         assert_ne!(proofs[0], proofs[1]);
+    }
+
+    #[test]
+    fn scram_rejects_iterations_above_maximum() {
+        for iterations in [MAX_SCRAM_ITERATIONS + 1, u32::MAX] {
+            let mut scram = ScramClient::new("secret");
+            let server_first = format!(
+                "r={}server,s={},i={iterations}",
+                scram.nonce,
+                encode(b"salt")
+            );
+            assert_eq!(
+                scram.process_server_first(&server_first).unwrap_err(),
+                format!("SCRAM iteration count {iterations} exceeds the maximum of 10000000")
+            );
+            assert_eq!(
+                scram.verify_server_final("v=AAAA").unwrap_err(),
+                "Missing salted password"
+            );
+
+            let accepted = format!("r={}server,s={},i=4096", scram.nonce, encode(b"salt"));
+            let client_final = scram.process_server_first(&accepted).unwrap();
+            assert!(client_final.starts_with(&format!("c=biws,r={}server,p=", scram.nonce)));
+        }
+    }
+
+    #[test]
+    fn scram_rejects_iterations_below_minimum() {
+        for iterations in [0, 1, MIN_SCRAM_ITERATIONS - 1] {
+            let mut scram = ScramClient::new("secret");
+            let server_first = format!(
+                "r={}server,s={},i={iterations}",
+                scram.nonce,
+                encode(b"salt")
+            );
+            assert_eq!(
+                scram.process_server_first(&server_first).unwrap_err(),
+                format!("SCRAM iteration count {iterations} is below the minimum of 4096")
+            );
+            assert_eq!(
+                scram.verify_server_final("v=AAAA").unwrap_err(),
+                "Missing salted password"
+            );
+        }
+    }
+
+    #[test]
+    fn scram_accepts_iterations_within_bounds() {
+        for iterations in [MIN_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS + 1] {
+            let mut scram = ScramClient::new("secret");
+            let server_first = format!(
+                "r={}server,s={},i={iterations}",
+                scram.nonce,
+                encode(b"salt")
+            );
+            let client_final = scram.process_server_first(&server_first).unwrap();
+            assert!(client_final.starts_with(&format!("c=biws,r={}server,p=", scram.nonce)));
+            assert_eq!(
+                scram.verify_server_final("v=AAAA").unwrap_err(),
+                "Server signature verification failed"
+            );
+        }
     }
 }
