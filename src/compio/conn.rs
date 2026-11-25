@@ -4,6 +4,7 @@ use compio::buf::BufResult;
 use compio::net::TcpStream;
 #[cfg(unix)]
 use compio::net::UnixStream;
+use std::time::Duration;
 
 use crate::buffer_pool::PooledBufferSet;
 use crate::conversion::ToParams;
@@ -32,6 +33,7 @@ pub struct Conn {
     pub(crate) transaction_status: TransactionStatus,
     pub(crate) is_broken: bool,
     name_counter: u64,
+    pub(crate) query_timeout: Option<Duration>,
     async_message_handler: AsyncMessageHandlerBox,
 }
 
@@ -42,7 +44,10 @@ impl Conn {
         Error: From<O::Error>,
     {
         let opts = opts.try_into()?;
+        timeout(opts.client_timeout.connect, Self::connect(opts)).await
+    }
 
+    async fn connect(opts: Opts) -> Result<Self> {
         let stream = if let Some(socket_path) = &opts.socket {
             #[cfg(unix)]
             {
@@ -62,14 +67,23 @@ impl Conn {
             let addr = format!("{}:{}", opts.host, opts.port);
             let tcp = TcpStream::connect(&addr).await?;
             tcp.set_nodelay(true)?;
+            opts.set_tcp_keepalive(&tcp)?;
             Stream::tcp(tcp)
         };
 
-        Self::new_with_stream(stream, opts).await
+        Self::startup(stream, opts).await
     }
 
     /// Connect using an existing stream.
-    pub async fn new_with_stream(mut stream: Stream, options: Opts) -> Result<Self> {
+    pub async fn new_with_stream(stream: Stream, options: Opts) -> Result<Self> {
+        timeout(
+            options.client_timeout.connect,
+            Self::startup(stream, options),
+        )
+        .await
+    }
+
+    async fn startup(mut stream: Stream, options: Opts) -> Result<Self> {
         let mut buffer_set = options.buffer_pool.get_buffer_set();
         let mut state_machine =
             ConnectionStateMachine::new(options.clone(), cfg!(feature = "compio-tls"));
@@ -149,13 +163,14 @@ impl Conn {
             transaction_status: state_machine.transaction_status(),
             is_broken: false,
             name_counter: 0,
+            query_timeout: options.client_timeout.query,
             async_message_handler: None,
         };
 
         // Upgrade to Unix socket if connected via TCP to loopback
         #[cfg(unix)]
         let conn = if options.upgrade_to_unix_socket && conn.stream.is_tcp_loopback() {
-            conn.try_upgrade_to_unix_socket(&options).await
+            conn.try_upgrade_to_unix_socket(&options).await?
         } else {
             conn
         };
@@ -169,17 +184,19 @@ impl Conn {
     fn try_upgrade_to_unix_socket(
         mut self,
         opts: &Opts,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Self> + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self>> + '_>> {
         let opts = opts.clone();
         Box::pin(async move {
             // Query unix_socket_directories from server
             let mut handler = FirstRowHandler::<(String,)>::new();
-            if self
+            if let Err(error) = self
                 .query("SHOW unix_socket_directories", &mut handler)
                 .await
-                .is_err()
             {
-                return self;
+                if self.is_broken {
+                    return Err(error);
+                }
+                return Ok(self);
             }
 
             let socket_dir = match handler.into_row() {
@@ -187,10 +204,10 @@ impl Conn {
                     // May contain multiple directories, use the first one
                     match dirs.split(',').next() {
                         Some(d) if !d.trim().is_empty() => d.trim().to_string(),
-                        _ => return self,
+                        _ => return Ok(self),
                     }
                 }
-                None => return self,
+                None => return Ok(self),
             };
 
             // Build socket path: {directory}/.s.PGSQL.{port}
@@ -199,16 +216,16 @@ impl Conn {
             // Connect via Unix socket
             let unix_stream = match UnixStream::connect(&socket_path).await {
                 Ok(s) => s,
-                Err(_) => return self,
+                Err(_) => return Ok(self),
             };
 
             // Create new connection over Unix socket
             let mut opts_unix = opts.clone();
             opts_unix.upgrade_to_unix_socket = false;
 
-            match Self::new_with_stream(Stream::unix(unix_stream), opts_unix).await {
-                Ok(new_conn) => new_conn,
-                Err(_) => self,
+            match Self::startup(Stream::unix(unix_stream), opts_unix).await {
+                Ok(new_conn) => Ok(new_conn),
+                Err(_) => Ok(self),
             }
         })
     }
@@ -397,7 +414,7 @@ impl Conn {
     /// Execute a simple query with a handler.
     pub async fn query<H: SimpleHandler>(&mut self, sql: &str, handler: &mut H) -> Result<()> {
         let mut state_machine = SimpleQueryStateMachine::new(handler, sql);
-        let result = self.drive(&mut state_machine).await;
+        let result = timeout(self.query_timeout, self.drive(&mut state_machine)).await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -449,14 +466,17 @@ impl Conn {
 
     /// Close the connection gracefully.
     pub async fn close(mut self) -> Result<()> {
-        self.buffer_set.write_buffer.clear();
-        write_terminate(&mut self.buffer_set.write_buffer);
-        let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-        let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-        self.buffer_set.write_buffer = buf;
-        result?;
-        self.stream.flush().await?;
-        Ok(())
+        timeout(self.query_timeout, async {
+            self.buffer_set.write_buffer.clear();
+            write_terminate(&mut self.buffer_set.write_buffer);
+            let buf = std::mem::take(&mut self.buffer_set.write_buffer);
+            let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
+            self.buffer_set.write_buffer = buf;
+            result?;
+            self.stream.flush().await?;
+            Ok(())
+        })
+        .await
     }
 
     // === Extended Query Protocol ===
@@ -474,7 +494,11 @@ impl Conn {
     ) -> Result<PreparedStatement> {
         self.name_counter += 1;
         let idx = self.name_counter;
-        let result = self.prepare_inner(idx, query, param_oids).await;
+        let result = timeout(
+            self.query_timeout,
+            self.prepare_inner(idx, query, param_oids),
+        )
+        .await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -492,7 +516,11 @@ impl Conn {
         let start_idx = self.name_counter + 1;
         self.name_counter += queries.len() as u64;
 
-        let result = self.prepare_batch_inner(queries, start_idx).await;
+        let result = timeout(
+            self.query_timeout,
+            self.prepare_batch_inner(queries, start_idx),
+        )
+        .await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -569,7 +597,11 @@ impl Conn {
         params: P,
         handler: &mut H,
     ) -> Result<()> {
-        let result = self.exec_inner(&statement, &params, handler).await;
+        let result = timeout(
+            self.query_timeout,
+            self.exec_inner(&statement, &params, handler),
+        )
+        .await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -674,9 +706,11 @@ impl Conn {
         params_list: &[P],
         chunk_size: usize,
     ) -> Result<()> {
-        let result = self
-            .exec_batch_inner(&statement, params_list, chunk_size)
-            .await;
+        let result = timeout(
+            self.query_timeout,
+            self.exec_batch_inner(&statement, params_list, chunk_size),
+        )
+        .await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -785,7 +819,11 @@ impl Conn {
 
     /// Close a prepared statement.
     pub async fn close_statement(&mut self, stmt: &PreparedStatement) -> Result<()> {
-        let result = self.close_statement_inner(&stmt.wire_name()).await;
+        let result = timeout(
+            self.query_timeout,
+            self.close_statement_inner(&stmt.wire_name()),
+        )
+        .await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -805,22 +843,31 @@ impl Conn {
 
     /// Low-level flush: send FLUSH to force server to send pending responses.
     pub async fn lowlevel_flush(&mut self) -> Result<()> {
-        use crate::protocol::frontend::write_flush;
+        let result = timeout(self.query_timeout, async {
+            use crate::protocol::frontend::write_flush;
 
-        self.buffer_set.write_buffer.clear();
-        write_flush(&mut self.buffer_set.write_buffer);
+            self.buffer_set.write_buffer.clear();
+            write_flush(&mut self.buffer_set.write_buffer);
 
-        let buf = std::mem::take(&mut self.buffer_set.write_buffer);
-        let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
-        self.buffer_set.write_buffer = buf;
-        result?;
-        self.stream.flush().await?;
-        Ok(())
+            let buf = std::mem::take(&mut self.buffer_set.write_buffer);
+            let BufResult(result, buf) = self.stream.write_all_owned(buf).await;
+            self.buffer_set.write_buffer = buf;
+            result?;
+            self.stream.flush().await?;
+            Ok(())
+        })
+        .await;
+        if let Err(e) = &result
+            && e.is_connection_broken()
+        {
+            self.is_broken = true;
+        }
+        result
     }
 
     /// Low-level sync: send SYNC and receive ReadyForQuery.
     pub async fn lowlevel_sync(&mut self) -> Result<()> {
-        let result = self.sync_inner().await;
+        let result = timeout(self.query_timeout, self.sync_inner()).await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -882,7 +929,11 @@ impl Conn {
         statement_name: &str,
         params: P,
     ) -> Result<()> {
-        let result = self.bind_inner(portal, statement_name, &params).await;
+        let result = timeout(
+            self.query_timeout,
+            self.bind_inner(portal, statement_name, &params),
+        )
+        .await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -951,7 +1002,11 @@ impl Conn {
         max_rows: u32,
         handler: &mut H,
     ) -> Result<bool> {
-        let result = self.execute_portal_inner(portal, max_rows, handler).await;
+        let result = timeout(
+            self.query_timeout,
+            self.execute_portal_inner(portal, max_rows, handler),
+        )
+        .await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -1085,37 +1140,41 @@ impl Conn {
         // Drive the state machine to completion (ParseComplete + BindComplete)
         let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
         let conn: &mut Self = &mut guard;
-        loop {
-            match state_machine.step(&mut conn.buffer_set)? {
-                Action::ReadMessage => {
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+        timeout(conn.query_timeout, async {
+            loop {
+                match state_machine.step(&mut conn.buffer_set)? {
+                    Action::ReadMessage => {
+                        conn.stream.read_message(&mut conn.buffer_set).await?;
+                    }
+                    Action::Write => {
+                        let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                        let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                        conn.buffer_set.write_buffer = buf;
+                        result?;
+                        conn.stream.flush().await?;
+                    }
+                    Action::WriteAndReadMessage => {
+                        let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
+                        let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
+                        conn.buffer_set.write_buffer = buf;
+                        result?;
+                        conn.stream.flush().await?;
+                        conn.stream.read_message(&mut conn.buffer_set).await?;
+                    }
+                    Action::Finished => break,
+                    _ => return Err(Error::LibraryBug("Unexpected action in bind".into())),
                 }
-                Action::Write => {
-                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
-                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
-                    conn.buffer_set.write_buffer = buf;
-                    result?;
-                    conn.stream.flush().await?;
-                }
-                Action::WriteAndReadMessage => {
-                    let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
-                    let BufResult(result, buf) = conn.stream.write_all_owned(buf).await;
-                    conn.buffer_set.write_buffer = buf;
-                    result?;
-                    conn.stream.flush().await?;
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
-                }
-                Action::Finished => break,
-                _ => return Err(Error::LibraryBug("Unexpected action in bind".into())),
             }
-        }
+            Ok(())
+        })
+        .await?;
 
         // Execute closure with portal handle
         let mut portal = super::unnamed_portal::UnnamedPortal { conn };
         let result = f(&mut portal).await;
 
         // Always sync to end implicit transaction (even on error)
-        let sync_result = portal.conn.sync_inner().await;
+        let sync_result = timeout(portal.conn.query_timeout, portal.conn.sync_inner()).await;
         std::mem::DropGuard::dismiss(guard);
 
         // Return closure result, or sync error if closure succeeded but sync failed
@@ -1128,7 +1187,7 @@ impl Conn {
 
     /// Low-level close portal: send Close(Portal) and receive CloseComplete.
     pub async fn lowlevel_close_portal(&mut self, portal: &str) -> Result<()> {
-        let result = self.close_portal_inner(portal).await;
+        let result = timeout(self.query_timeout, self.close_portal_inner(portal)).await;
         if let Err(e) = &result
             && e.is_connection_broken()
         {
@@ -1240,3 +1299,16 @@ impl Conn {
 }
 
 use crate::state::simple_query::SimpleQueryStateMachine;
+
+pub(crate) async fn timeout<T>(
+    duration: Option<Duration>,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(duration) = duration else {
+        return future.await;
+    };
+    match compio::time::timeout(duration, future).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(Error::Io(std::io::ErrorKind::TimedOut.into())),
+    }
+}

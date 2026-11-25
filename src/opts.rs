@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 
 use url::Url;
 
@@ -41,6 +42,27 @@ impl TlsMode {
 
     pub(crate) fn requires_channel_binding(self) -> bool {
         matches!(self, Self::ChannelBinding | Self::Hardened)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientTimeout {
+    pub connect: Option<Duration>,
+    pub query: Option<Duration>,
+    pub tcp_keepalive_idle_secs: u32,
+    pub tcp_keepalive_interval_secs: u32,
+    pub tcp_keepalive_count: u32,
+}
+
+impl Default for ClientTimeout {
+    fn default() -> Self {
+        Self {
+            connect: Some(Duration::from_secs(5)),
+            query: Some(Duration::from_secs(5)),
+            tcp_keepalive_idle_secs: 1,
+            tcp_keepalive_interval_secs: 1,
+            tcp_keepalive_count: 5,
+        }
     }
 }
 
@@ -150,6 +172,8 @@ pub struct Opts {
     /// Default: `None`
     pub pool_max_concurrency: Option<usize>,
 
+    pub client_timeout: ClientTimeout,
+
     /// Buffer pool for reusing buffers across connections.
     ///
     /// Default: `GLOBAL_BUFFER_POOL`
@@ -162,6 +186,44 @@ impl Opts {
             return password_fn().map(|password| Some(Cow::Owned(password)));
         }
         Ok(self.password.as_deref().map(Cow::Borrowed))
+    }
+
+    pub(crate) fn set_tcp_keepalive<S>(&self, socket: &S) -> Result<(), Error>
+    where
+        for<'a> socket2::SockRef<'a>: From<&'a S>,
+    {
+        if self.client_timeout.tcp_keepalive_idle_secs == 0
+            || self.client_timeout.tcp_keepalive_interval_secs == 0
+            || self.client_timeout.tcp_keepalive_count == 0
+        {
+            return Err(Error::InvalidUsage(format!(
+                "tcp_keepalive_idle_secs, tcp_keepalive_interval_secs and tcp_keepalive_count must be at least 1, got {}, {}, {}",
+                self.client_timeout.tcp_keepalive_idle_secs,
+                self.client_timeout.tcp_keepalive_interval_secs,
+                self.client_timeout.tcp_keepalive_count
+            )));
+        }
+        let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(u64::from(
+            self.client_timeout.tcp_keepalive_idle_secs,
+        )));
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "windows",
+        ))]
+        let keepalive = keepalive
+            .with_interval(Duration::from_secs(u64::from(
+                self.client_timeout.tcp_keepalive_interval_secs,
+            )))
+            .with_retries(self.client_timeout.tcp_keepalive_count);
+        socket2::SockRef::from(socket).set_tcp_keepalive(&keepalive)?;
+        Ok(())
     }
 }
 
@@ -185,6 +247,7 @@ impl Default for Opts {
             upgrade_to_unix_socket: true,
             pool_max_idle_conn: 100,
             pool_max_concurrency: None,
+            client_timeout: ClientTimeout::default(),
             buffer_pool: Arc::clone(&GLOBAL_BUFFER_POOL),
         }
     }
@@ -268,6 +331,21 @@ impl TryFrom<&Url> for Opts {
                         Error::InvalidUsage(format!("Invalid pool_max_concurrency: {}", value))
                     })?);
                 }
+                "client_timeout.connect" => {
+                    opts.client_timeout.connect = parse_seconds(&key, &value)?;
+                }
+                "client_timeout.query" => {
+                    opts.client_timeout.query = parse_seconds(&key, &value)?;
+                }
+                "client_timeout.tcp_keepalive_idle_secs" => {
+                    opts.client_timeout.tcp_keepalive_idle_secs = parse_positive(&key, &value)?;
+                }
+                "client_timeout.tcp_keepalive_interval_secs" => {
+                    opts.client_timeout.tcp_keepalive_interval_secs = parse_positive(&key, &value)?;
+                }
+                "client_timeout.tcp_keepalive_count" => {
+                    opts.client_timeout.tcp_keepalive_count = parse_positive(&key, &value)?;
+                }
                 _ => {
                     opts.params.push((key.to_string(), value.to_string()));
                 }
@@ -285,6 +363,23 @@ impl TryFrom<&str> for Opts {
         let url = Url::parse(s).map_err(|e| Error::InvalidUsage(format!("Invalid URL: {}", e)))?;
         Self::try_from(&url)
     }
+}
+
+fn parse_seconds(key: &str, value: &str) -> Result<Option<Duration>, Error> {
+    let duration = value
+        .parse()
+        .ok()
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .ok_or_else(|| Error::InvalidUsage(format!("Invalid {}: {}", key, value)))?;
+    Ok((!duration.is_zero()).then_some(duration))
+}
+
+fn parse_positive(key: &str, value: &str) -> Result<u32, Error> {
+    value
+        .parse()
+        .ok()
+        .filter(|parsed| *parsed > 0)
+        .ok_or_else(|| Error::InvalidUsage(format!("Invalid {}: {}", key, value)))
 }
 
 fn percent_decode(s: &str) -> Result<String, Error> {
