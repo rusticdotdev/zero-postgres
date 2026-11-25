@@ -132,7 +132,7 @@
 </head>
 <body>
 <div class="page">
-<nav class="sidebar" aria-label="Contents"><details open><summary>Contents</summary><ul><li><a href="#overview">Protocol Overview</a><ul><li><a href="#versions">Protocol Versions</a></li><li><a href="#framing">Message Framing</a></li><li><a href="#types">Message Data Types</a></li><li><a href="#formats">Format Codes</a></li><li><a href="#index">Message Index</a></li></ul></li><li><a href="#startup">Connection Startup</a><ul><li><a href="#encryption">Session Encryption</a></li><li><a href="#startupmessage">StartupMessage</a></li><li><a href="#negotiate">Version and Extension Negotiation</a></li><li><a href="#auth">Authentication</a></li><li><a href="#sasl">SASL Authentication</a></li><li><a href="#postauth">After AuthenticationOk</a></li></ul></li><li><a href="#simple">Simple Query Protocol</a><ul><li><a href="#responses-per-statement">Responses per statement</a></li><li><a href="#multiple-statements-in-one-query">Multiple statements in one Query</a></li><li><a href="#rowdescription">RowDescription</a></li><li><a href="#datarow">DataRow</a></li><li><a href="#commandcomplete">CommandComplete</a></li></ul></li><li><a href="#extended">Extended Query Protocol</a><ul><li><a href="#extended-messages">Messages</a></li><li><a href="#extended-errors">Error Recovery</a></li><li><a href="#lifetimes">Statement and Portal Lifetimes</a></li></ul></li><li><a href="#pipelining">Pipelining</a><ul><li><a href="#segments">Segments</a></li><li><a href="#transaction-outcomes">Transaction outcomes</a></li><li><a href="#client-requirements">Client requirements</a></li><li><a href="#restrictions-and-edge-cases">Restrictions and edge cases</a></li><li><a href="#when-it-helps">When it helps</a></li></ul></li><li><a href="#copy">COPY Protocol</a><ul><li><a href="#copy-out-copy-to-stdout">Copy-out (<code>COPY ... TO STDOUT</code>)</a></li><li><a href="#copy-in-copy-from-stdin">Copy-in (<code>COPY ... FROM STDIN</code>)</a></li><li><a href="#copy-both">Copy-both</a></li><li><a href="#message-layouts">Message layouts</a></li><li><a href="#text-format">Text format</a></li><li><a href="#csv-format">CSV format</a></li><li><a href="#json-format">JSON format</a></li><li><a href="#binary-format">Binary format</a></li></ul></li><li><a href="#function-call">Function Call Protocol</a></li><li><a href="#async">Asynchronous Messages</a><ul><li><a href="#noticeresponse">NoticeResponse</a></li><li><a href="#parameterstatus">ParameterStatus</a></li><li><a href="#notificationresponse">NotificationResponse</a></li></ul></li><li><a href="#errors">Error and Notice Messages</a></li><li><a href="#cancel">Query Cancellation</a></li><li><a href="#terminate">Connection Termination</a></li><li><a href="#notes">Implementation Checklist</a></li><li><a href="#refs">References</a></li></ul></details></nav>
+<nav class="sidebar" aria-label="Contents"><details open><summary>Contents</summary><ul><li><a href="#overview">Protocol Overview</a><ul><li><a href="#versions">Protocol Versions</a></li><li><a href="#framing">Message Framing</a></li><li><a href="#types">Message Data Types</a></li><li><a href="#formats">Format Codes</a></li><li><a href="#index">Message Index</a></li></ul></li><li><a href="#startup">Connection Startup</a><ul><li><a href="#encryption">Session Encryption</a></li><li><a href="#startupmessage"><code>StartupMessage</code></a></li><li><a href="#negotiate"><code>NegotiateProtocolVersion</code></a></li><li><a href="#auth">Authentication</a></li><li><a href="#sasl">SASL Authentication</a></li><li><a href="#postauth">After <code>AuthenticationOk</code></a></li></ul></li><li><a href="#simple">Simple Query Protocol</a><ul><li><a href="#responses-per-statement">Responses per statement</a></li><li><a href="#multiple-statements-in-one-query">Multiple statements in one <code>Query</code></a></li><li><a href="#rowdescription"><code>RowDescription</code></a></li><li><a href="#datarow"><code>DataRow</code></a></li><li><a href="#commandcomplete"><code>CommandComplete</code></a></li></ul></li><li><a href="#extended">Extended Query Protocol</a><ul><li><a href="#extended-messages">Messages</a></li><li><a href="#extended-errors">Error Recovery</a></li><li><a href="#lifetimes">Statement and Portal Lifetimes</a></li></ul></li><li><a href="#pipelining">Pipelining</a><ul><li><a href="#segments">Segments</a></li><li><a href="#transaction-outcomes">Transaction outcomes</a></li><li><a href="#client-requirements">Client requirements</a></li><li><a href="#restrictions-and-edge-cases">Restrictions and edge cases</a></li><li><a href="#when-it-helps">When it helps</a></li></ul></li><li><a href="#copy">COPY Protocol</a><ul><li><a href="#copy-out-copy-to-stdout">Copy-out (<code>COPY ... TO STDOUT</code>)</a></li><li><a href="#copy-in-copy-from-stdin">Copy-in (<code>COPY ... FROM STDIN</code>)</a></li><li><a href="#copy-both">Copy-both</a></li><li><a href="#message-layouts">Message layouts</a></li><li><a href="#text-format">Text format</a></li><li><a href="#csv-format">CSV format</a></li><li><a href="#json-format">JSON format</a></li><li><a href="#binary-format">Binary format</a></li></ul></li><li><a href="#function-call">Function Call Protocol</a></li><li><a href="#async">Asynchronous Messages</a><ul><li><a href="#noticeresponse"><code>NoticeResponse</code></a></li><li><a href="#parameterstatus"><code>ParameterStatus</code></a></li><li><a href="#notificationresponse"><code>NotificationResponse</code></a></li></ul></li><li><a href="#errors">Error and Notice Messages</a></li><li><a href="#cancel">Query Cancellation</a></li><li><a href="#terminate">Connection Termination</a></li><li><a href="#notes">Implementation Checklist</a></li><li><a href="#refs">References</a></li></ul></details></nav>
 <main>
 
 <h1>PostgreSQL Wire Protocol Reference</h1>
@@ -156,7 +156,7 @@ Streaming and logical replication are out of scope.</p>
 <tr><td>3.9999</td><td><code>0x0003270F</code></td><td>Reserved for greasing. libpq may send it to test that servers and middleware negotiate correctly.</td></tr>
 <tr><td>2.0</td><td>&nbsp;</td><td>Obsolete. Supported up to PostgreSQL 13.</td></tr>
 </table></div>
-<p>See <a href="#negotiate">Version and Extension Negotiation</a> for how client and server settle on a version.</p>
+<p>See <a href="#negotiate">NegotiateProtocolVersion</a> for how client and server settle on a version.</p>
 
 <h3 id="framing">Message Framing</h3>
 <div class="packet"><svg viewBox="0 0 760 68" role="img" aria-label="Message framing: a 1-byte Type, a 4-byte Length, then Length minus 4 bytes of Payload"><title>Message framing: a 1-byte Type, a 4-byte Length, then Length minus 4 bytes of Payload</title><rect class="packet-cell" x="1.0" y="1" width="137.8" height="66"/><text class="packet-title" x="69.9" y="27" text-anchor="middle">Type</text><text class="packet-detail" x="69.9" y="49" text-anchor="middle">1 byte</text><rect class="packet-cell" x="138.8" y="1" width="206.7" height="66"/><text class="packet-title" x="242.2" y="27" text-anchor="middle">Length</text><text class="packet-detail" x="242.2" y="49" text-anchor="middle">4 bytes</text><rect class="packet-cell" x="345.5" y="1" width="413.5" height="66"/><text class="packet-title" x="552.3" y="27" text-anchor="middle">Payload</text><text class="packet-detail" x="552.3" y="49" text-anchor="middle">(Length - 4) bytes</text></svg></div>
@@ -245,7 +245,7 @@ Streaming and logical replication are out of scope.</p>
 <h3 id="encryption">Session Encryption</h3>
 <p>Encryption is requested before StartupMessage. The protocol cannot force it, so a client that requires encryption must close the connection when the server declines. A server administrator can separately reject unencrypted sessions during authentication.</p>
 
-<h4>SSLRequest (no type byte)</h4>
+<h4><code>SSLRequest</code> (no type byte)</h4>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Int32(8)</code></td><td>Length</td></tr>
@@ -263,7 +263,7 @@ Streaming and logical replication are out of scope.</p>
 <h4>Direct TLS</h4>
 <p>A client can start the TLS handshake immediately without SSLRequest, then send StartupMessage inside TLS. The client must use ALPN with the protocol name <code>postgresql</code> (RFC 7301). This mode cannot negotiate GSSAPI or fall back to an unencrypted connection. The server refuses any other encryption request on such a connection.</p>
 
-<h4>GSSENCRequest (no type byte)</h4>
+<h4><code>GSSENCRequest</code> (no type byte)</h4>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Int32(8)</code></td><td>Length</td></tr>
@@ -277,7 +277,7 @@ Streaming and logical replication are out of scope.</p>
 <li>Keep encrypted packets under 16 kB, which is the limit the server accepts. Use <code>gss_wrap_size_limit()</code> to split larger messages across <code>gss_wrap()</code> calls. The server will not send packets larger than 16 kB.</li>
 </ol>
 
-<h3 id="startupmessage">StartupMessage</h3>
+<h3 id="startupmessage"><code>StartupMessage</code></h3>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Int32</code></td><td>Length, including self</td></tr>
@@ -293,13 +293,13 @@ Streaming and logical replication are out of scope.</p>
 <tr><td><code>database</code></td><td>Database name. Defaults to the user name.</td></tr>
 <tr><td><code>options</code></td><td>Backend command-line arguments, separated by spaces. Write a space inside an argument as <code>\ </code> and a literal backslash as <code>\\</code>. Deprecated in favour of individual run-time parameters.</td></tr>
 <tr><td><code>replication</code></td><td><code>false</code> (default), <code>true</code> for physical replication mode, or <code>database</code> for logical replication mode.</td></tr>
-<tr><td><code>_pq_.*</code></td><td>Protocol extension request; see <a href="#negotiate">Negotiation</a>.</td></tr>
+<tr><td><code>_pq_.*</code></td><td>Protocol extension request; see <a href="#negotiate">NegotiateProtocolVersion</a>.</td></tr>
 <tr><td>anything else</td><td>A run-time parameter, such as <code>client_encoding</code> or <code>application_name</code>, applied as a session default after <code>options</code> is parsed. A failure to apply it produces ErrorResponse and ends the connection.</td></tr>
 </table></div>
 
 <p>Parameters can appear in any order.</p>
 
-<h3 id="negotiate">Version and Extension Negotiation</h3>
+<h3 id="negotiate"><code>NegotiateProtocolVersion</code></h3>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('v')</code></td><td>NegotiateProtocolVersion</td></tr>
@@ -433,7 +433,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 <li>Reconnect: after obtaining a token by any OAuth flow, send it in <code>auth</code>. If the client is authorized, the server replies with AuthenticationOk.</li>
 </ol>
 
-<h3 id="postauth">After AuthenticationOk</h3>
+<h3 id="postauth">After <code>AuthenticationOk</code></h3>
 <p>The client sends nothing until ReadyForQuery. The server can still fail startup with ErrorResponse, or send NegotiateProtocolVersion or NoticeResponse. Normally it sends ParameterStatus messages, BackendKeyData, then ReadyForQuery.</p>
 <div class="table-wrap"><table class="layout">
 <caption>BackendKeyData</caption>
@@ -476,7 +476,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 </table></div>
 <p>An error can occur partway through a statement's messages. ErrorResponse aborts the rest of the query string, and ReadyForQuery always follows. Values are in text format, unless the statement is a <code>FETCH</code> from a cursor declared <code>BINARY</code>; the format codes in RowDescription show which applies.</p>
 
-<h3 id="multiple-statements-in-one-query">Multiple statements in one Query</h3>
+<h3 id="multiple-statements-in-one-query">Multiple statements in one <code>Query</code></h3>
 <ul>
 <li>Without explicit transaction control, the statements run in one implicit transaction block, which commits at the end of the message or rolls back on error.</li>
 <li>A <code>COMMIT</code> or <code>ROLLBACK</code> closes the current block. Any following statements run in a new implicit block. In an implicit block, the server also issues a warning, since there was no matching <code>BEGIN</code>.</li>
@@ -488,7 +488,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 <li>All statements in the message see the same <code>statement_timestamp()</code>.</li>
 </ul>
 
-<h3 id="rowdescription">RowDescription</h3>
+<h3 id="rowdescription"><code>RowDescription</code></h3>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('T')</code></td><td>Message type</td></tr>
@@ -504,7 +504,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 <tr class="nested"><td><code>Int16</code></td><td>Format code; always 0 from the statement variant of Describe</td></tr>
 </table></div>
 
-<h3 id="datarow">DataRow</h3>
+<h3 id="datarow"><code>DataRow</code></h3>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('D')</code></td><td>Message type</td></tr>
@@ -515,7 +515,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 <tr class="nested"><td><code>Byten</code></td><td>Value; absent when NULL</td></tr>
 </table></div>
 
-<h3 id="commandcomplete">CommandComplete</h3>
+<h3 id="commandcomplete"><code>CommandComplete</code></h3>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('C')</code></td><td>Message type</td></tr>
@@ -546,7 +546,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 
 <h3 id="extended-messages">Messages</h3>
 
-<h4>Parse</h4>
+<h4><code>Parse</code></h4>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('P')</code></td><td>Message type</td></tr>
@@ -563,7 +563,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 <li>A parameter can be declared with the OID of <code>void</code> to stand for an OUT argument of a function. Pass NULL for it in Bind.</li>
 </ul>
 
-<h4>Bind</h4>
+<h4><code>Bind</code></h4>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('B')</code></td><td>Message type</td></tr>
@@ -583,7 +583,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 <p>Both format code lists follow the same rule. Zero codes means all text, or that there are no such values. One code applies to all values. Otherwise the list has one code per value. Result formats come only from Bind; a cursor's <code>BINARY</code> attribute is ignored in this protocol.</p>
 <p>The server typically plans the query while processing Bind, and may reuse a generic plan on later Binds of the same statement.</p>
 
-<h4>Describe</h4>
+<h4><code>Describe</code></h4>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('D')</code></td><td>Message type</td></tr>
@@ -605,7 +605,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 <tr><td><code>Int32[N]</code></td><td>Parameter type OIDs</td></tr>
 </table></div>
 
-<h4>Execute</h4>
+<h4><code>Execute</code></h4>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('E')</code></td><td>Message type</td></tr>
@@ -621,7 +621,7 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 <li><strong>ErrorResponse</strong>.</li>
 </ul>
 
-<h4>Close</h4>
+<h4><code>Close</code></h4>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('C')</code></td><td>Message type</td></tr>
@@ -633,10 +633,10 @@ ServerSignature = HMAC(ServerKey, AuthMessage)</code></pre>
 <p>The documentation says that closing a statement also closes portals built from it.</p>
 <p class="observed">A portal bound from a statement still executed after that statement was closed in the same transaction. Close portals explicitly, and do not rely on either behaviour.</p>
 
-<h4>Sync</h4>
+<h4><code>Sync</code></h4>
 <p>Marks the end of a series of extended-query messages. If the session is not in a <code>BEGIN</code> block, Sync closes the current transaction, committing on success and rolling back on error. Inside a <code>BEGIN</code> block, the transaction stays open. The reply is ReadyForQuery, whose status byte shows which case applies. Each Sync produces exactly one ReadyForQuery.</p>
 
-<h4>Flush</h4>
+<h4><code>Flush</code></h4>
 <p>Forces the server to deliver pending output. It produces no message of its own, does not end a transaction, and does not cause ReadyForQuery. It is needed after any extended-query command other than Sync if the client wants to see the results before sending more.</p>
 
 <h3 id="extended-errors">Error Recovery</h3>
@@ -849,10 +849,10 @@ Execute "p1" (max 1), Sync               → DataRow, PortalSuspended, ReadyForQ
 <h2 id="async">Asynchronous Messages</h2>
 <p>The server can send these without a client request. After startup, the client must be ready to accept them at any point, including while idle and during COPY, and should at minimum check for them before it starts reading a query response. During startup, the server sends none of them before AuthenticationOk. After AuthenticationOk, it sends ParameterStatus and can send NoticeResponse.</p>
 
-<h3 id="noticeresponse">NoticeResponse</h3>
+<h3 id="noticeresponse"><code>NoticeResponse</code></h3>
 <p>Layout is under <a href="#errors">Error and Notice Messages</a>. Notices can come from outside events, such as a server shutdown request, and do not stop the current command. Display them or pass them to the application.</p>
 
-<h3 id="parameterstatus">ParameterStatus</h3>
+<h3 id="parameterstatus"><code>ParameterStatus</code></h3>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('S')</code></td><td>Message type</td></tr>
@@ -864,7 +864,7 @@ Execute "p1" (max 1), Sync               → DataRow, PortalSuspended, ReadyForQ
 <p>The currently reported parameters are <code>application_name</code>, <code>client_encoding</code>, <code>DateStyle</code>, <code>default_transaction_read_only</code>, <code>in_hot_standby</code>, <code>integer_datetimes</code>, <code>IntervalStyle</code>, <code>is_superuser</code>, <code>scram_iterations</code>, <code>search_path</code>, <code>server_encoding</code>, <code>server_version</code>, <code>session_authorization</code>, <code>standard_conforming_strings</code> and <code>TimeZone</code>. This set may change, so ignore unknown names. Older servers report fewer: <code>default_transaction_read_only</code> and <code>in_hot_standby</code> start in PostgreSQL 14, <code>scram_iterations</code> in 16, and <code>search_path</code> in 18. <code>server_version</code>, <code>server_encoding</code> and <code>integer_datetimes</code> cannot change after startup.</p>
 <p class="observed">After <code>SET</code>, the message arrived after CommandComplete and just before ReadyForQuery. A <code>SET</code> and <code>ROLLBACK</code> inside one Query message produced none, since the value was unchanged by then. Separate messages produced one each.</p>
 
-<h3 id="notificationresponse">NotificationResponse</h3>
+<h3 id="notificationresponse"><code>NotificationResponse</code></h3>
 <div class="table-wrap"><table class="layout">
 <tr><th>Type</th><th>Description</th></tr>
 <tr><td><code>Byte1('A')</code></td><td>Message type</td></tr>
