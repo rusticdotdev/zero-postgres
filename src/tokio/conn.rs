@@ -85,8 +85,7 @@ impl Conn {
 
     async fn startup(mut stream: Stream, options: Opts) -> Result<Self> {
         let mut buffer_set = options.buffer_pool.get_buffer_set();
-        let mut state_machine =
-            ConnectionStateMachine::new(options.clone(), cfg!(feature = "tokio-tls"));
+        let mut state_machine = ConnectionStateMachine::new(&options, cfg!(feature = "tokio-tls"));
 
         // Drive the connection state machine
         loop {
@@ -957,7 +956,7 @@ impl Conn {
             match type_byte {
                 msg_type::READY_FOR_QUERY => {
                     let ready = ReadyForQuery::parse(&conn.buffer_set.read_buffer)?;
-                    conn.transaction_status = ready.transaction_status().unwrap_or_default();
+                    conn.transaction_status = ready.transaction_status()?;
                     std::mem::DropGuard::dismiss(guard);
                     if let Some(e) = pending_error {
                         return Err(e);
