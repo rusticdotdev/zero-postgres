@@ -2951,6 +2951,7 @@ dependencies = [
  "rustls-platform-verifier",
  "sha2",
  "simdutf8",
+ "socket2",
  "thiserror",
  "time",
  "tokio",

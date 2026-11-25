@@ -63,6 +63,7 @@ impl Conn {
             let addr = format!("{}:{}", opts.host, opts.port);
             let tcp = TcpStream::connect(&addr)?;
             tcp.set_nodelay(true)?;
+            opts.set_tcp_keepalive(&tcp)?;
             Stream::tcp(tcp)
         };
 
@@ -144,7 +145,7 @@ impl Conn {
         // Upgrade to Unix socket if connected via TCP to loopback
         #[cfg(unix)]
         let conn = if options.upgrade_to_unix_socket && conn.stream.is_tcp_loopback() {
-            conn.try_upgrade_to_unix_socket(&options)
+            conn.try_upgrade_to_unix_socket(&options)?
         } else {
             conn
         };
@@ -155,14 +156,14 @@ impl Conn {
     /// Try to upgrade to Unix socket connection.
     /// Returns upgraded conn on success, original conn on failure.
     #[cfg(unix)]
-    fn try_upgrade_to_unix_socket(mut self, opts: &Opts) -> Self {
+    fn try_upgrade_to_unix_socket(mut self, opts: &Opts) -> Result<Self> {
         // Query unix_socket_directories from server
         let mut handler = FirstRowHandler::<(String,)>::new();
-        if self
-            .query("SHOW unix_socket_directories", &mut handler)
-            .is_err()
-        {
-            return self;
+        if let Err(error) = self.query("SHOW unix_socket_directories", &mut handler) {
+            if self.is_broken {
+                return Err(error);
+            }
+            return Ok(self);
         }
 
         let socket_dir = match handler.into_row() {
@@ -170,10 +171,10 @@ impl Conn {
                 // May contain multiple directories, use the first one
                 match dirs.split(',').next() {
                     Some(d) if !d.trim().is_empty() => d.trim().to_string(),
-                    _ => return self,
+                    _ => return Ok(self),
                 }
             }
-            None => return self,
+            None => return Ok(self),
         };
 
         // Build socket path: {directory}/.s.PGSQL.{port}
@@ -182,7 +183,7 @@ impl Conn {
         // Connect via Unix socket
         let unix_stream = match UnixStream::connect(&socket_path) {
             Ok(s) => s,
-            Err(_) => return self,
+            Err(_) => return Ok(self),
         };
 
         // Create new connection over Unix socket
@@ -190,8 +191,8 @@ impl Conn {
         opts_unix.upgrade_to_unix_socket = false;
 
         match Self::new_with_stream(Stream::unix(unix_stream), opts_unix) {
-            Ok(new_conn) => new_conn,
-            Err(_) => self,
+            Ok(new_conn) => Ok(new_conn),
+            Err(_) => Ok(self),
         }
     }
 

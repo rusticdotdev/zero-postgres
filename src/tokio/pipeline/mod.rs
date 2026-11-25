@@ -47,7 +47,7 @@ use crate::protocol::frontend::{
 use crate::state::extended::PreparedStatement;
 use crate::statement::{IntoStatement, StatementRef};
 
-use super::conn::Conn;
+use super::conn::{Conn, timeout};
 
 /// Async pipeline mode for batching multiple queries.
 ///
@@ -111,6 +111,10 @@ impl<'a> Pipeline<'a> {
     }
 
     async fn cleanup_inner(&mut self) {
+        if self.conn.is_broken {
+            return;
+        }
+
         // Nothing to clean up if no operations were queued and no expectations pending
         if self.queue_seq == 0 && self.expectations.is_empty() {
             return;
@@ -323,7 +327,11 @@ impl<'a> Pipeline<'a> {
         ticket: Ticket<'_>,
         handler: &mut H,
     ) -> Result<()> {
-        self.claim_with_handler(ticket, handler).await
+        timeout(
+            self.conn.query_timeout,
+            self.claim_with_handler(ticket, handler),
+        )
+        .await
     }
 
     async fn claim_with_handler<H: ExtendedHandler>(
@@ -378,7 +386,11 @@ impl<'a> Pipeline<'a> {
         ticket: Ticket<'_>,
     ) -> Result<Vec<T>> {
         let mut handler = crate::handler::CollectHandler::<T>::new();
-        self.claim_with_handler(ticket, &mut handler).await?;
+        timeout(
+            self.conn.query_timeout,
+            self.claim_with_handler(ticket, &mut handler),
+        )
+        .await?;
         Ok(handler.into_rows())
     }
 
@@ -390,7 +402,11 @@ impl<'a> Pipeline<'a> {
         ticket: Ticket<'_>,
     ) -> Result<Option<T>> {
         let mut handler = crate::handler::FirstRowHandler::<T>::new();
-        self.claim_with_handler(ticket, &mut handler).await?;
+        timeout(
+            self.conn.query_timeout,
+            self.claim_with_handler(ticket, &mut handler),
+        )
+        .await?;
         Ok(handler.into_row())
     }
 
@@ -399,7 +415,11 @@ impl<'a> Pipeline<'a> {
     /// Results must be claimed in the same order they were queued.
     pub async fn claim_drop(&mut self, ticket: Ticket<'_>) -> Result<()> {
         let mut handler = crate::handler::DropHandler::new();
-        self.claim_with_handler(ticket, &mut handler).await
+        timeout(
+            self.conn.query_timeout,
+            self.claim_with_handler(ticket, &mut handler),
+        )
+        .await
     }
 
     /// Check that the ticket sequence matches the expected claim sequence.

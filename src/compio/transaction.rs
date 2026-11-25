@@ -1,6 +1,7 @@
 //! Transaction support for asynchronous PostgreSQL connections.
 
 use super::Conn;
+use super::conn::timeout;
 use super::named_portal::NamedPortal;
 use crate::conversion::ToParams;
 use crate::error::{Error, Result};
@@ -62,9 +63,11 @@ impl Transaction {
         }
 
         let portal_name = conn.next_portal_name();
-        let result = conn
-            .create_named_portal(&portal_name, &statement, &params)
-            .await;
+        let result = timeout(
+            conn.query_timeout,
+            conn.create_named_portal(&portal_name, &statement, &params),
+        )
+        .await;
 
         if let Err(e) = result {
             if e.is_connection_broken() {
