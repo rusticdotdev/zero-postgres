@@ -79,7 +79,7 @@ impl FakeServer {
         Opts {
             host: "127.0.0.1".into(),
             port: self.port,
-            user: "u".into(),
+            user: c"u".into(),
             upgrade_to_unix_socket: false,
             ..Opts::default()
         }
@@ -303,7 +303,7 @@ fn url_parses_timeout_options() -> TestResult {
     assert!(
         opts.params
             .iter()
-            .all(|(name, _)| !TIMEOUT_KEYS.contains(&name.as_str())),
+            .all(|(name, _)| !TIMEOUT_KEYS.contains(&name.to_str().unwrap())),
         "{:?}",
         opts.params
     );
@@ -373,7 +373,7 @@ fn url_statement_timeout_stays_in_params() -> TestResult {
     let opts = Opts::try_from("postgres://u@localhost/db?statement_timeout=5s")?;
     assert_eq!(
         opts.params,
-        [("statement_timeout".to_string(), "5s".to_string())]
+        [(c"statement_timeout".to_owned(), c"5s".to_owned())]
     );
     assert_default_timeouts(&opts);
     Ok(())

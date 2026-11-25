@@ -1,6 +1,7 @@
 //! Connection startup and authentication state machine.
 
 use std::borrow::Cow;
+use std::ffi::CStr;
 
 use crate::error::{Error, Result};
 #[cfg(feature = "auth-gss")]
@@ -133,7 +134,7 @@ impl<'a> ConnectionStateMachine<'a> {
             self.state = State::WaitingSslResponse;
             Ok(Action::WriteAndReadByte)
         } else {
-            self.write_startup_message(&mut buffer_set.write_buffer);
+            self.write_startup_message(&mut buffer_set.write_buffer)?;
             self.state = State::WaitingAuth;
             Ok(Action::WriteAndReadMessage)
         }
@@ -153,7 +154,7 @@ impl<'a> ConnectionStateMachine<'a> {
                 }
                 // SSL not supported, continue with plain connection
                 buffer_set.write_buffer.clear();
-                self.write_startup_message(&mut buffer_set.write_buffer);
+                self.write_startup_message(&mut buffer_set.write_buffer)?;
                 self.state = State::WaitingAuth;
                 Ok(Action::WriteAndReadMessage)
             }
@@ -166,28 +167,34 @@ impl<'a> ConnectionStateMachine<'a> {
 
     fn handle_tls_handshake_complete(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
         buffer_set.write_buffer.clear();
-        self.write_startup_message(&mut buffer_set.write_buffer);
+        self.write_startup_message(&mut buffer_set.write_buffer)?;
         self.state = State::WaitingAuth;
         Ok(Action::WriteAndReadMessage)
     }
 
-    fn write_startup_message(&self, write_buffer: &mut Vec<u8>) {
-        let mut params: Vec<(&str, &str)> =
-            vec![("user", &self.options.user), ("client_encoding", "UTF8")];
+    fn write_startup_message(&self, write_buffer: &mut Vec<u8>) -> Result<()> {
+        let mut params: Vec<(&CStr, &CStr)> =
+            vec![(c"user", &self.options.user), (c"client_encoding", c"UTF8")];
 
         if let Some(db) = &self.options.database {
-            params.push(("database", db));
+            params.push((c"database", db));
         }
 
         if let Some(app) = &self.options.application_name {
-            params.push(("application_name", app));
+            params.push((c"application_name", app));
         }
 
         for (name, value) in &self.options.params {
+            if name.is_empty() {
+                return Err(Error::InvalidUsage(
+                    "Empty parameter name in Opts::params".into(),
+                ));
+            }
             params.push((name, value));
         }
 
         write_startup(write_buffer, &params);
+        Ok(())
     }
 
     fn required_password(&self) -> Result<Cow<'_, str>> {
@@ -222,7 +229,7 @@ impl<'a> ConnectionStateMachine<'a> {
                 .options
                 .params
                 .iter()
-                .filter(|(name, _)| name.starts_with("_pq_."))
+                .filter(|(name, _)| name.to_bytes().starts_with(b"_pq_."))
                 .count();
             let negotiate =
                 NegotiateProtocolVersion::parse(&buffer_set.read_buffer, sent_option_count)?;
@@ -280,7 +287,7 @@ impl<'a> ConnectionStateMachine<'a> {
             AuthenticationMessage::Md5Password { salt } => {
                 let password = self.required_password()?;
 
-                let hashed = md5_password(&self.options.user, &password, &salt);
+                let hashed = md5_password(self.options.user.to_bytes(), &password, &salt);
                 buffer_set.write_buffer.clear();
                 write_password(&mut buffer_set.write_buffer, &hashed);
                 self.state = State::WaitingAuthResult;
@@ -711,11 +718,11 @@ mod tests {
         payload
     }
 
-    fn opts_with_params(params: &[(&str, &str)]) -> Opts {
+    fn opts_with_params(params: &[(&CStr, &CStr)]) -> Opts {
         Opts {
             params: params
                 .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
             ..Opts::default()
         }
@@ -755,9 +762,9 @@ mod tests {
     #[test]
     fn negotiate_rejects_unrecognized_options() {
         for sent in [
-            &[("_pq_.unknown", "on")][..],
-            &[("search_path", "public"), ("_pq_.unknown", "on")],
-            &[("_pq_.other", "1"), ("_pq_.unknown", "on")],
+            &[(c"_pq_.unknown", c"on")][..],
+            &[(c"search_path", c"public"), (c"_pq_.unknown", c"on")],
+            &[(c"_pq_.other", c"1"), (c"_pq_.unknown", c"on")],
         ] {
             let options = opts_with_params(sent);
             let mut machine = auth_machine(&options);
@@ -780,16 +787,16 @@ mod tests {
     fn negotiate_rejects_option_count_above_sent_options() {
         for (sent, options) in [
             (&[][..], &["_pq_.unknown"][..]),
-            (&[("search_path", "public")], &["_pq_.unknown"]),
+            (&[(c"search_path", c"public")], &["_pq_.unknown"]),
             (
                 &[
-                    ("search_path", "public"),
-                    ("pq_.almost", "1"),
-                    ("x_pq_.y", "1"),
+                    (c"search_path", c"public"),
+                    (c"pq_.almost", c"1"),
+                    (c"x_pq_.y", c"1"),
                 ],
                 &["_pq_.unknown"],
             ),
-            (&[("_pq_.a", "1")], &["_pq_.a", "_pq_.b"]),
+            (&[(c"_pq_.a", c"1")], &["_pq_.a", "_pq_.b"]),
         ] {
             let opts = opts_with_params(sent);
             let mut machine = auth_machine(&opts);
@@ -812,7 +819,7 @@ mod tests {
     fn negotiate_rejects_u32_max_option_count() {
         let mut payload = PROTOCOL_VERSION_3_0.to_be_bytes().to_vec();
         payload.extend_from_slice(&u32::MAX.to_be_bytes());
-        let options = opts_with_params(&[("_pq_.a", "1"), ("_pq_.b", "2")]);
+        let options = opts_with_params(&[(c"_pq_.a", c"1"), (c"_pq_.b", c"2")]);
         let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         let err = feed(
@@ -831,7 +838,7 @@ mod tests {
     #[test]
     fn negotiate_without_rejected_options_continues_to_authentication() {
         for version in [PROTOCOL_VERSION_3_0, PROTOCOL_VERSION_3_2] {
-            let options = opts_with_params(&[("search_path", "public"), ("_pq_.a", "1")]);
+            let options = opts_with_params(&[(c"search_path", c"public"), (c"_pq_.a", c"1")]);
             let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             assert!(matches!(
@@ -883,7 +890,7 @@ mod tests {
     fn initial_step_without_tls_support_allows_only_insecure() {
         for tls_mode in TlsMode::ALL {
             let options = Opts {
-                user: "alice".into(),
+                user: c"alice".into(),
                 tls_mode,
                 ..Opts::default()
             };
@@ -912,9 +919,37 @@ mod tests {
         }
     }
 
+    fn initial_startup_message(options: &Opts) -> Vec<u8> {
+        let mut machine = ConnectionStateMachine::new(options, false);
+        let mut buffer_set = BufferSet::new();
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::WriteAndReadMessage)
+        ));
+        assert_eq!(machine.state, State::WaitingAuth);
+        buffer_set.write_buffer
+    }
+
+    #[test]
+    fn initial_step_writes_startup_message_bytes() {
+        let options = Opts {
+            user: c"alice".into(),
+            database: Some(c"shop".into()),
+            application_name: Some(c"app".into()),
+            params: vec![(c"search_path".into(), c"public".into())],
+            tls_mode: TlsMode::Insecure,
+            ..Opts::default()
+        };
+        let body: &[u8] = b"user\0alice\0client_encoding\0UTF8\0database\0shop\0application_name\0app\0search_path\0public\0\0";
+        let mut expected = ((8 + body.len()) as i32).to_be_bytes().to_vec();
+        expected.extend_from_slice(&196610_i32.to_be_bytes());
+        expected.extend_from_slice(body);
+        assert_eq!(initial_startup_message(&options), expected);
+    }
+
     fn ssl_response_opts(tls_mode: TlsMode) -> Opts {
         Opts {
-            user: "alice".into(),
+            user: c"alice".into(),
             tls_mode,
             ..Opts::default()
         }
@@ -928,6 +963,107 @@ mod tests {
             Ok(Action::WriteAndReadByte)
         ));
         (machine, buffer_set)
+    }
+
+    fn is_empty_parameter_name_error(err: &Error) -> bool {
+        matches!(err, Error::InvalidUsage(message) if message == "Empty parameter name in Opts::params")
+    }
+
+    #[test]
+    fn initial_step_rejects_empty_parameter_name() {
+        for params in [
+            vec![(c"".into(), c"x".into())],
+            vec![
+                (c"search_path".into(), c"public".into()),
+                (c"".into(), c"".into()),
+            ],
+        ] {
+            let options = Opts {
+                user: c"alice".into(),
+                params,
+                tls_mode: TlsMode::Insecure,
+                ..Opts::default()
+            };
+            let mut machine = ConnectionStateMachine::new(&options, false);
+            let mut buffer_set = BufferSet::new();
+            buffer_set.write_buffer.extend_from_slice(b"stale");
+            let err = machine.step(&mut buffer_set).unwrap_err();
+            assert!(is_empty_parameter_name_error(&err), "{err}");
+            assert!(buffer_set.write_buffer.is_empty());
+            assert_eq!(machine.state, State::Initial);
+        }
+    }
+
+    #[test]
+    fn initial_step_accepts_empty_parameter_value() {
+        let options = Opts {
+            user: c"alice".into(),
+            params: vec![(c"search_path".into(), c"".into())],
+            tls_mode: TlsMode::Insecure,
+            ..Opts::default()
+        };
+        let body: &[u8] = b"user\0alice\0client_encoding\0UTF8\0search_path\0\0\0";
+        let mut expected = ((8 + body.len()) as i32).to_be_bytes().to_vec();
+        expected.extend_from_slice(&196610_i32.to_be_bytes());
+        expected.extend_from_slice(body);
+        assert_eq!(initial_startup_message(&options), expected);
+    }
+
+    #[test]
+    fn ssl_response_refused_rejects_empty_parameter_name() {
+        let options = Opts {
+            user: c"alice".into(),
+            params: vec![(c"".into(), c"x".into())],
+            tls_mode: TlsMode::Insecure,
+            ..Opts::default()
+        };
+        let (mut machine, mut buffer_set) = ssl_response_machine(&options);
+        assert_eq!(buffer_set.write_buffer, SSL_REQUEST);
+        machine.set_ssl_response(b'N');
+        let err = machine.step(&mut buffer_set).unwrap_err();
+        assert!(is_empty_parameter_name_error(&err), "{err}");
+        assert!(buffer_set.write_buffer.is_empty());
+        assert_eq!(machine.state, State::WaitingSslResponse);
+    }
+
+    #[test]
+    fn tls_handshake_complete_rejects_empty_parameter_name() {
+        for tls_mode in TlsMode::ALL {
+            let options = Opts {
+                user: c"alice".into(),
+                params: vec![(c"".into(), c"x".into())],
+                tls_mode,
+                ..Opts::default()
+            };
+            let (mut machine, mut buffer_set) = ssl_response_machine(&options);
+            machine.set_ssl_response(b'S');
+            assert!(matches!(
+                machine.step(&mut buffer_set),
+                Ok(Action::TlsHandshake)
+            ));
+            let err = machine.step(&mut buffer_set).unwrap_err();
+            assert!(is_empty_parameter_name_error(&err), "{tls_mode:?}: {err}");
+            assert!(buffer_set.write_buffer.is_empty(), "{tls_mode:?}");
+            assert_eq!(machine.state, State::WaitingTlsHandshake, "{tls_mode:?}");
+        }
+    }
+
+    #[test]
+    fn ssl_response_refused_accepts_empty_parameter_value() {
+        let options = Opts {
+            user: c"alice".into(),
+            params: vec![(c"search_path".into(), c"".into())],
+            tls_mode: TlsMode::Insecure,
+            ..Opts::default()
+        };
+        let (mut machine, mut buffer_set) = ssl_response_machine(&options);
+        machine.set_ssl_response(b'N');
+        assert!(matches!(
+            machine.step(&mut buffer_set),
+            Ok(Action::WriteAndReadMessage)
+        ));
+        assert_eq!(buffer_set.write_buffer, initial_startup_message(&options));
+        assert_eq!(machine.state, State::WaitingAuth);
     }
 
     #[test]
@@ -1098,7 +1234,7 @@ mod tests {
     #[test]
     fn password_fn_takes_precedence_over_password() {
         let options = Opts {
-            user: "alice".into(),
+            user: c"alice".into(),
             password: Some("static".into()),
             password_fn: Some(Arc::new(|| Ok("dynamic".into()))),
             ..Opts::default()
@@ -1128,7 +1264,7 @@ mod tests {
             &auth_payload(5, &salt),
         )
         .unwrap();
-        let mut expected = md5_password("alice", "dynamic", &salt).into_bytes();
+        let mut expected = md5_password(b"alice", "dynamic", &salt).into_bytes();
         expected.push(0);
         assert_eq!(md5_buffer_set.write_buffer, password_message(&expected));
     }
