@@ -11,9 +11,6 @@ pub const PROTOCOL_VERSION_3_2: i32 = 196610;
 /// SSL request code
 pub const SSL_REQUEST_CODE: i32 = 80877103;
 
-/// GSSAPI encryption request code
-pub const GSSENC_REQUEST_CODE: i32 = 80877104;
-
 /// Cancel request code
 pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 
@@ -24,16 +21,6 @@ pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 pub fn write_ssl_request(buf: &mut Vec<u8>) {
     let mut msg = MessageBuilder::new_startup(buf);
     msg.write_i32(SSL_REQUEST_CODE);
-    msg.finish();
-}
-
-/// Write a GSSENCRequest message.
-///
-/// This is sent before StartupMessage to request GSSAPI encryption.
-/// Server responds with single byte: 'G' (accepted) or 'N' (rejected).
-pub fn write_gssenc_request(buf: &mut Vec<u8>) {
-    let mut msg = MessageBuilder::new_startup(buf);
-    msg.write_i32(GSSENC_REQUEST_CODE);
     msg.finish();
 }
 
