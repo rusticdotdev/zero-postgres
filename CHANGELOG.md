@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.11.0](https://github.com/rusticdotdev/zero-postgres/compare/v0.10.0...v0.11.0) - 2026-11-25
+
+### <!-- 0 -->New features
+- [**breaking**] add client timeout options ([#91](https://github.com/rusticdotdev/zero-postgres/pull/91))
+- channel binding for RSA-PSS certificates
+- SCRAM-SHA-256-PLUS authentication
+- GSSAPI and SSPI authentication ([#86](https://github.com/rusticdotdev/zero-postgres/pull/86))
+- add OAUTHBEARER authentication and Opts::oauth_discovery_fn
+- add Opts::password_fn and Opts::oauth_bearer_token_fn
+- add BufferPool::soft_buffer_cap
+
+### <!-- 1 -->Bug fixes
+- [**breaking**] reject NUL bytes and empty names in startup parameters
+- [**breaking**] bound the SCRAM iteration count
+- [**breaking**] reject invalid NegotiateProtocolVersion and ReadyForQuery fields
+- redact secret key in BackendKeyData Debug
+- mark the connection broken when an operation stops mid-response
+
+### <!-- 3 -->Documentation
+- add authentication methods and dynamic credentials to the book
+
+### <!-- 9 -->Other
+- refactor: drop unused state and clones in ScramClient
+- [**breaking**] refactor!: remove unused write_gssenc_request
+- [**breaking**] refactor!: introduce a new set of TlsMode
+- refactor: remove unnecessary query_inner
+
 ## [v0.10.0](https://github.com/rusticdotdev/zero-postgres/compare/v0.9.0...v0.10.0) - 2026-11-21
 
 ### <!-- 0 -->Breaking Changes
