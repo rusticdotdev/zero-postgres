@@ -29,32 +29,25 @@ enum State {
     Initial,
     WaitingSslResponse,
     WaitingTlsHandshake,
-    WaitingAuthRead,
     WaitingAuth,
-    SaslInProgressRead,
     SaslInProgress,
-    OauthInProgressRead,
     OauthInProgress,
-    OauthFailedRead,
     OauthFailed,
     #[cfg(feature = "auth-gss")]
     GssStepPending,
     #[cfg(feature = "auth-gss")]
     GssStepFinished,
     #[cfg(feature = "auth-gss")]
-    GssInProgressRead,
-    #[cfg(feature = "auth-gss")]
     GssInProgress,
-    WaitingAuthResultRead,
     WaitingAuthResult,
     WaitingReady,
     Finished,
 }
 
 /// Connection startup state machine.
-pub struct ConnectionStateMachine {
+pub struct ConnectionStateMachine<'a> {
     state: State,
-    options: Opts,
+    options: &'a Opts,
     backend_key: Option<BackendKeyData>,
     server_params: Vec<(String, String)>,
     transaction_status: TransactionStatus,
@@ -70,11 +63,11 @@ pub struct ConnectionStateMachine {
     server_certificate_der: Option<Vec<u8>>,
 }
 
-impl ConnectionStateMachine {
+impl<'a> ConnectionStateMachine<'a> {
     /// Create a new connection state machine.
     ///
     /// `tls_supported` tells whether the driver can handle [`Action::TlsHandshake`].
-    pub fn new(options: Opts, tls_supported: bool) -> Self {
+    pub fn new(options: &'a Opts, tls_supported: bool) -> Self {
         Self {
             state: State::Initial,
             options,
@@ -141,8 +134,8 @@ impl ConnectionStateMachine {
             Ok(Action::WriteAndReadByte)
         } else {
             self.write_startup_message(&mut buffer_set.write_buffer);
-            self.state = State::WaitingAuthRead;
-            Ok(Action::Write)
+            self.state = State::WaitingAuth;
+            Ok(Action::WriteAndReadMessage)
         }
     }
 
@@ -161,8 +154,8 @@ impl ConnectionStateMachine {
                 // SSL not supported, continue with plain connection
                 buffer_set.write_buffer.clear();
                 self.write_startup_message(&mut buffer_set.write_buffer);
-                self.state = State::WaitingAuthRead;
-                Ok(Action::Write)
+                self.state = State::WaitingAuth;
+                Ok(Action::WriteAndReadMessage)
             }
             _ => Err(Error::LibraryBug(format!(
                 "Unexpected SSL response: {}",
@@ -174,8 +167,8 @@ impl ConnectionStateMachine {
     fn handle_tls_handshake_complete(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
         buffer_set.write_buffer.clear();
         self.write_startup_message(&mut buffer_set.write_buffer);
-        self.state = State::WaitingAuthRead;
-        Ok(Action::Write)
+        self.state = State::WaitingAuth;
+        Ok(Action::WriteAndReadMessage)
     }
 
     fn write_startup_message(&self, write_buffer: &mut Vec<u8>) {
@@ -217,15 +210,22 @@ impl ConnectionStateMachine {
         );
 
         self.scram_client = Some(scram);
-        self.state = State::SaslInProgressRead;
-        Action::Write
+        self.state = State::SaslInProgress;
+        Action::WriteAndReadMessage
     }
 
     fn handle_auth_message(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
         let type_byte = buffer_set.type_byte;
 
         if type_byte == msg_type::NEGOTIATE_PROTOCOL_VERSION {
-            let negotiate = NegotiateProtocolVersion::parse(&buffer_set.read_buffer)?;
+            let sent_option_count = self
+                .options
+                .params
+                .iter()
+                .filter(|(name, _)| name.starts_with("_pq_."))
+                .count();
+            let negotiate =
+                NegotiateProtocolVersion::parse(&buffer_set.read_buffer, sent_option_count)?;
             if !matches!(
                 negotiate.newest_version,
                 PROTOCOL_VERSION_3_0 | PROTOCOL_VERSION_3_2
@@ -274,8 +274,8 @@ impl ConnectionStateMachine {
 
                 buffer_set.write_buffer.clear();
                 write_password(&mut buffer_set.write_buffer, &password);
-                self.state = State::WaitingAuthResultRead;
-                Ok(Action::Write)
+                self.state = State::WaitingAuthResult;
+                Ok(Action::WriteAndReadMessage)
             }
             AuthenticationMessage::Md5Password { salt } => {
                 let password = self.required_password()?;
@@ -283,8 +283,8 @@ impl ConnectionStateMachine {
                 let hashed = md5_password(&self.options.user, &password, &salt);
                 buffer_set.write_buffer.clear();
                 write_password(&mut buffer_set.write_buffer, &hashed);
-                self.state = State::WaitingAuthResultRead;
-                Ok(Action::Write)
+                self.state = State::WaitingAuthResult;
+                Ok(Action::WriteAndReadMessage)
             }
             AuthenticationMessage::Sasl { mechanisms } => {
                 let tls_server_end_point = self.tls_server_end_point();
@@ -340,8 +340,8 @@ impl ConnectionStateMachine {
                         "OAUTHBEARER",
                         initial_response.as_bytes(),
                     );
-                    self.state = State::OauthInProgressRead;
-                    return Ok(Action::Write);
+                    self.state = State::OauthInProgress;
+                    return Ok(Action::WriteAndReadMessage);
                 }
 
                 Err(Error::Auth(format!(
@@ -414,8 +414,8 @@ impl ConnectionStateMachine {
             Some(token) => {
                 buffer_set.write_buffer.clear();
                 write_gss_response(&mut buffer_set.write_buffer, &token);
-                self.state = State::GssInProgressRead;
-                Ok(Action::Write)
+                self.state = State::GssInProgress;
+                Ok(Action::WriteAndReadMessage)
             }
             None if complete => {
                 self.state = State::GssInProgress;
@@ -488,8 +488,8 @@ impl ConnectionStateMachine {
 
                 buffer_set.write_buffer.clear();
                 write_sasl_response(&mut buffer_set.write_buffer, b"\x01");
-                self.state = State::OauthFailedRead;
-                Ok(Action::Write)
+                self.state = State::OauthFailed;
+                Ok(Action::WriteAndReadMessage)
             }
             _ => Err(Error::Auth(format!(
                 "Unexpected OAUTHBEARER message: {:?}",
@@ -525,8 +525,8 @@ impl ConnectionStateMachine {
 
                 buffer_set.write_buffer.clear();
                 write_sasl_response(&mut buffer_set.write_buffer, client_final.as_bytes());
-                self.state = State::SaslInProgressRead;
-                Ok(Action::Write)
+                self.state = State::SaslInProgress;
+                Ok(Action::WriteAndReadMessage)
             }
             AuthenticationMessage::SaslFinal { data } => {
                 let scram = self
@@ -589,7 +589,7 @@ impl ConnectionStateMachine {
             }
             msg_type::READY_FOR_QUERY => {
                 let ready = ReadyForQuery::parse(payload)?;
-                self.transaction_status = ready.transaction_status().unwrap_or_default();
+                self.transaction_status = ready.transaction_status()?;
                 self.state = State::Finished;
                 Ok(Action::Finished)
             }
@@ -636,29 +636,13 @@ impl ConnectionStateMachine {
     }
 }
 
-impl StateMachine for ConnectionStateMachine {
+impl StateMachine for ConnectionStateMachine<'_> {
     fn step(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
         // Handle states that don't need to read buffer_set
         match self.state {
             State::Initial => return self.handle_initial(buffer_set),
             State::WaitingSslResponse => return self.handle_ssl_response(buffer_set),
             State::WaitingTlsHandshake => return self.handle_tls_handshake_complete(buffer_set),
-            State::WaitingAuthRead => {
-                self.state = State::WaitingAuth;
-                return Ok(Action::ReadMessage);
-            }
-            State::SaslInProgressRead => {
-                self.state = State::SaslInProgress;
-                return Ok(Action::ReadMessage);
-            }
-            State::OauthInProgressRead => {
-                self.state = State::OauthInProgress;
-                return Ok(Action::ReadMessage);
-            }
-            State::OauthFailedRead => {
-                self.state = State::OauthFailed;
-                return Ok(Action::ReadMessage);
-            }
             #[cfg(feature = "auth-gss")]
             State::GssStepPending => {
                 return Err(Error::LibraryBug(
@@ -667,15 +651,6 @@ impl StateMachine for ConnectionStateMachine {
             }
             #[cfg(feature = "auth-gss")]
             State::GssStepFinished => return self.handle_gss_step_finished(buffer_set),
-            #[cfg(feature = "auth-gss")]
-            State::GssInProgressRead => {
-                self.state = State::GssInProgress;
-                return Ok(Action::ReadMessage);
-            }
-            State::WaitingAuthResultRead => {
-                self.state = State::WaitingAuthResult;
-                return Ok(Action::ReadMessage);
-            }
             _ => {}
         }
 
@@ -726,22 +701,35 @@ mod tests {
     use crate::opts::TlsMode;
     use std::sync::Arc;
 
-    fn step_negotiate(newest_version: i32, options: &[&str]) -> Result<Action> {
-        let mut machine = ConnectionStateMachine::new(Opts::default(), false);
-        machine.state = State::WaitingAuth;
-        let mut buffer_set = BufferSet::new();
-        buffer_set.type_byte = msg_type::NEGOTIATE_PROTOCOL_VERSION;
-        buffer_set
-            .read_buffer
-            .extend_from_slice(&newest_version.to_be_bytes());
-        buffer_set
-            .read_buffer
-            .extend_from_slice(&(options.len() as i32).to_be_bytes());
+    fn negotiate_message(newest_version: i32, options: &[&str]) -> Vec<u8> {
+        let mut payload = newest_version.to_be_bytes().to_vec();
+        payload.extend_from_slice(&(options.len() as i32).to_be_bytes());
         for option in options {
-            buffer_set.read_buffer.extend_from_slice(option.as_bytes());
-            buffer_set.read_buffer.push(0);
+            payload.extend_from_slice(option.as_bytes());
+            payload.push(0);
         }
-        machine.step(&mut buffer_set)
+        payload
+    }
+
+    fn opts_with_params(params: &[(&str, &str)]) -> Opts {
+        Opts {
+            params: params
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            ..Opts::default()
+        }
+    }
+
+    fn step_negotiate(newest_version: i32, options: &[&str]) -> Result<Action> {
+        let opts = Opts::default();
+        let mut machine = auth_machine(&opts);
+        feed(
+            &mut machine,
+            &mut BufferSet::new(),
+            msg_type::NEGOTIATE_PROTOCOL_VERSION,
+            &negotiate_message(newest_version, options),
+        )
     }
 
     #[test]
@@ -766,7 +754,107 @@ mod tests {
 
     #[test]
     fn negotiate_rejects_unrecognized_options() {
-        step_negotiate(PROTOCOL_VERSION_3_0, &["_pq_.unknown"]).unwrap_err();
+        for sent in [
+            &[("_pq_.unknown", "on")][..],
+            &[("search_path", "public"), ("_pq_.unknown", "on")],
+            &[("_pq_.other", "1"), ("_pq_.unknown", "on")],
+        ] {
+            let options = opts_with_params(sent);
+            let mut machine = auth_machine(&options);
+            let mut buffer_set = BufferSet::new();
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::NEGOTIATE_PROTOCOL_VERSION,
+                &negotiate_message(PROTOCOL_VERSION_3_0, &["_pq_.unknown"]),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::Unsupported(message) if message.starts_with("Server rejected protocol options") && message.contains("_pq_.unknown")),
+                "{sent:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn negotiate_rejects_option_count_above_sent_options() {
+        for (sent, options) in [
+            (&[][..], &["_pq_.unknown"][..]),
+            (&[("search_path", "public")], &["_pq_.unknown"]),
+            (
+                &[
+                    ("search_path", "public"),
+                    ("pq_.almost", "1"),
+                    ("x_pq_.y", "1"),
+                ],
+                &["_pq_.unknown"],
+            ),
+            (&[("_pq_.a", "1")], &["_pq_.a", "_pq_.b"]),
+        ] {
+            let opts = opts_with_params(sent);
+            let mut machine = auth_machine(&opts);
+            let mut buffer_set = BufferSet::new();
+            let err = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::NEGOTIATE_PROTOCOL_VERSION,
+                &negotiate_message(PROTOCOL_VERSION_3_0, options),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::LibraryBug(message) if message.starts_with("NegotiateProtocolVersion: server rejected")),
+                "{sent:?} {options:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn negotiate_rejects_u32_max_option_count() {
+        let mut payload = PROTOCOL_VERSION_3_0.to_be_bytes().to_vec();
+        payload.extend_from_slice(&u32::MAX.to_be_bytes());
+        let options = opts_with_params(&[("_pq_.a", "1"), ("_pq_.b", "2")]);
+        let mut machine = auth_machine(&options);
+        let mut buffer_set = BufferSet::new();
+        let err = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::NEGOTIATE_PROTOCOL_VERSION,
+            &payload,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::LibraryBug(message) if message.starts_with("NegotiateProtocolVersion: server rejected")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn negotiate_without_rejected_options_continues_to_authentication() {
+        for version in [PROTOCOL_VERSION_3_0, PROTOCOL_VERSION_3_2] {
+            let options = opts_with_params(&[("search_path", "public"), ("_pq_.a", "1")]);
+            let mut machine = auth_machine(&options);
+            let mut buffer_set = BufferSet::new();
+            assert!(matches!(
+                feed(
+                    &mut machine,
+                    &mut buffer_set,
+                    msg_type::NEGOTIATE_PROTOCOL_VERSION,
+                    &negotiate_message(version, &[]),
+                ),
+                Ok(Action::ReadMessage)
+            ));
+            assert_eq!(machine.state, State::WaitingAuth);
+            assert!(matches!(
+                feed(
+                    &mut machine,
+                    &mut buffer_set,
+                    msg_type::AUTHENTICATION,
+                    &auth_payload(0, &[]),
+                ),
+                Ok(Action::ReadMessage)
+            ));
+            assert_eq!(machine.state, State::WaitingReady);
+        }
     }
 
     const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F];
@@ -778,7 +866,7 @@ mod tests {
                 tls_mode,
                 ..Opts::default()
             };
-            let mut machine = ConnectionStateMachine::new(options, true);
+            let mut machine = ConnectionStateMachine::new(&options, true);
             let mut buffer_set = BufferSet::new();
             buffer_set.write_buffer.extend_from_slice(b"stale");
             let action = machine.step(&mut buffer_set);
@@ -799,12 +887,15 @@ mod tests {
                 tls_mode,
                 ..Opts::default()
             };
-            let mut machine = ConnectionStateMachine::new(options, false);
+            let mut machine = ConnectionStateMachine::new(&options, false);
             let mut buffer_set = BufferSet::new();
             let result = machine.step(&mut buffer_set);
             if tls_mode == TlsMode::Insecure {
-                assert!(matches!(result, Ok(Action::Write)), "{tls_mode:?}");
-                assert_eq!(machine.state, State::WaitingAuthRead);
+                assert!(
+                    matches!(result, Ok(Action::WriteAndReadMessage)),
+                    "{tls_mode:?}"
+                );
+                assert_eq!(machine.state, State::WaitingAuth);
                 assert_ne!(buffer_set.write_buffer[..], SSL_REQUEST);
                 assert!(
                     buffer_set
@@ -821,12 +912,15 @@ mod tests {
         }
     }
 
-    fn ssl_response_machine(tls_mode: TlsMode) -> (ConnectionStateMachine, BufferSet) {
-        let options = Opts {
+    fn ssl_response_opts(tls_mode: TlsMode) -> Opts {
+        Opts {
             user: "alice".into(),
             tls_mode,
             ..Opts::default()
-        };
+        }
+    }
+
+    fn ssl_response_machine(options: &Opts) -> (ConnectionStateMachine<'_>, BufferSet) {
         let mut machine = ConnectionStateMachine::new(options, true);
         let mut buffer_set = BufferSet::new();
         assert!(matches!(
@@ -839,12 +933,16 @@ mod tests {
     #[test]
     fn ssl_response_refused_allows_only_insecure() {
         for tls_mode in TlsMode::ALL {
-            let (mut machine, mut buffer_set) = ssl_response_machine(tls_mode);
+            let options = ssl_response_opts(tls_mode);
+            let (mut machine, mut buffer_set) = ssl_response_machine(&options);
             machine.set_ssl_response(b'N');
             let result = machine.step(&mut buffer_set);
             if tls_mode == TlsMode::Insecure {
-                assert!(matches!(result, Ok(Action::Write)), "{tls_mode:?}");
-                assert_eq!(machine.state, State::WaitingAuthRead);
+                assert!(
+                    matches!(result, Ok(Action::WriteAndReadMessage)),
+                    "{tls_mode:?}"
+                );
+                assert_eq!(machine.state, State::WaitingAuth);
                 assert_ne!(buffer_set.write_buffer[..], SSL_REQUEST);
                 assert!(
                     buffer_set
@@ -852,10 +950,6 @@ mod tests {
                         .windows(b"user\0alice\0".len())
                         .any(|window| window == b"user\0alice\0")
                 );
-                assert!(matches!(
-                    machine.step(&mut buffer_set),
-                    Ok(Action::ReadMessage)
-                ));
                 assert_eq!(machine.state, State::WaitingAuth);
             } else {
                 let err = result.unwrap_err();
@@ -871,15 +965,19 @@ mod tests {
     #[test]
     fn ssl_response_accepted_starts_tls_handshake_for_every_tls_mode() {
         for tls_mode in TlsMode::ALL {
-            let (mut machine, mut buffer_set) = ssl_response_machine(tls_mode);
+            let options = ssl_response_opts(tls_mode);
+            let (mut machine, mut buffer_set) = ssl_response_machine(&options);
             machine.set_ssl_response(b'S');
             assert!(
                 matches!(machine.step(&mut buffer_set), Ok(Action::TlsHandshake)),
                 "{tls_mode:?}"
             );
             assert_eq!(machine.state, State::WaitingTlsHandshake);
-            assert!(matches!(machine.step(&mut buffer_set), Ok(Action::Write)));
-            assert_eq!(machine.state, State::WaitingAuthRead);
+            assert!(matches!(
+                machine.step(&mut buffer_set),
+                Ok(Action::WriteAndReadMessage)
+            ));
+            assert_eq!(machine.state, State::WaitingAuth);
         }
     }
 
@@ -887,7 +985,8 @@ mod tests {
     fn ssl_response_unexpected_byte_is_library_bug_for_every_tls_mode() {
         for tls_mode in TlsMode::ALL {
             for response in [0, b'E', b's', b'n'] {
-                let (mut machine, mut buffer_set) = ssl_response_machine(tls_mode);
+                let options = ssl_response_opts(tls_mode);
+                let (mut machine, mut buffer_set) = ssl_response_machine(&options);
                 machine.set_ssl_response(response);
                 let err = machine.step(&mut buffer_set).unwrap_err();
                 assert!(
@@ -898,7 +997,7 @@ mod tests {
         }
     }
 
-    fn auth_machine(options: Opts) -> ConnectionStateMachine {
+    fn auth_machine(options: &Opts) -> ConnectionStateMachine<'_> {
         let mut machine = ConnectionStateMachine::new(options, false);
         machine.state = State::WaitingAuth;
         machine
@@ -951,7 +1050,7 @@ mod tests {
                 password: Some("secret".into()),
                 ..Opts::default()
             };
-            let mut machine = auth_machine(options);
+            let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             let err = feed(
                 &mut machine,
@@ -974,7 +1073,7 @@ mod tests {
             password_fn: Some(Arc::new(|| Ok("from-fn".into()))),
             ..Opts::default()
         };
-        let mut machine = auth_machine(options);
+        let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         let action = feed(
             &mut machine,
@@ -982,14 +1081,10 @@ mod tests {
             msg_type::AUTHENTICATION,
             &auth_payload(3, &[]),
         );
-        assert!(matches!(action, Ok(Action::Write)));
+        assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
         assert_eq!(buffer_set.write_buffer, password_message(b"from-fn\0"));
-        assert_eq!(machine.state, State::WaitingAuthResultRead);
+        assert_eq!(machine.state, State::WaitingAuthResult);
 
-        assert!(matches!(
-            machine.step(&mut buffer_set),
-            Ok(Action::ReadMessage)
-        ));
         let ok_action = feed(
             &mut machine,
             &mut buffer_set,
@@ -1009,7 +1104,7 @@ mod tests {
             ..Opts::default()
         };
 
-        let mut cleartext_machine = auth_machine(options.clone());
+        let mut cleartext_machine = auth_machine(&options);
         let mut cleartext_buffer_set = BufferSet::new();
         feed(
             &mut cleartext_machine,
@@ -1024,7 +1119,7 @@ mod tests {
         );
 
         let salt = [0x01, 0x02, 0x03, 0x04];
-        let mut md5_machine = auth_machine(options);
+        let mut md5_machine = auth_machine(&options);
         let mut md5_buffer_set = BufferSet::new();
         feed(
             &mut md5_machine,
@@ -1050,7 +1145,7 @@ mod tests {
             ..Opts::default()
         };
 
-        let mut cleartext_machine = auth_machine(options.clone());
+        let mut cleartext_machine = auth_machine(&options);
         let mut cleartext_buffer_set = BufferSet::new();
         feed(
             &mut cleartext_machine,
@@ -1064,7 +1159,7 @@ mod tests {
             password_message(b"pw0\0")
         );
 
-        let mut scram_machine = auth_machine(options);
+        let mut scram_machine = auth_machine(&options);
         let mut scram_buffer_set = BufferSet::new();
         feed(
             &mut scram_machine,
@@ -1089,7 +1184,7 @@ mod tests {
             sasl_payload(&["SCRAM-SHA-256"]),
         ];
         for payload in payloads {
-            let mut machine = auth_machine(options.clone());
+            let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             let err = feed(
                 &mut machine,
@@ -1113,7 +1208,7 @@ mod tests {
             password_fn: Some(Arc::new(|| Ok(String::new()))),
             ..Opts::default()
         };
-        let mut machine = auth_machine(options);
+        let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         feed(
             &mut machine,
@@ -1131,7 +1226,7 @@ mod tests {
             password: Some("static".into()),
             ..Opts::default()
         };
-        let mut machine = auth_machine(options);
+        let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         feed(
             &mut machine,
@@ -1151,7 +1246,8 @@ mod tests {
             sasl_payload(&["SCRAM-SHA-256"]),
         ];
         for payload in payloads {
-            let mut machine = auth_machine(Opts::default());
+            let options = Opts::default();
+            let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             let err = feed(
                 &mut machine,
@@ -1171,7 +1267,8 @@ mod tests {
     #[test]
     fn gss_and_sspi_unsupported_without_auth_gss() {
         for code in [7, 9] {
-            let mut machine = auth_machine(Opts::default());
+            let options = Opts::default();
+            let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             let err = feed(
                 &mut machine,
@@ -1189,7 +1286,8 @@ mod tests {
     #[test]
     fn gss_and_sspi_require_host() {
         for code in [7, 9] {
-            let mut machine = auth_machine(Opts::default());
+            let options = Opts::default();
+            let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             let err = feed(
                 &mut machine,
@@ -1215,7 +1313,7 @@ mod tests {
                 host: "db.example.test".into(),
                 ..Opts::default()
             };
-            let mut machine = auth_machine(options);
+            let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             let action = feed(
                 &mut machine,
@@ -1272,11 +1370,11 @@ mod tests {
 
     const OAUTH_ERROR_JSON: &str = r#"{"status":"invalid_token","openid-configuration":"https://issuer.example/.well-known/openid-configuration","scope":"openid"}"#;
 
-    fn oauth_rejected_machine(
-        options: Opts,
+    fn oauth_rejected_machine<'a>(
+        options: &'a Opts,
         buffer_set: &mut BufferSet,
         error_json: &[u8],
-    ) -> (ConnectionStateMachine, Result<Action>) {
+    ) -> (ConnectionStateMachine<'a>, Result<Action>) {
         let mut machine = auth_machine(options);
         feed(
             &mut machine,
@@ -1285,7 +1383,6 @@ mod tests {
             &sasl_payload(&["OAUTHBEARER"]),
         )
         .unwrap();
-        assert!(matches!(machine.step(buffer_set), Ok(Action::ReadMessage)));
         assert_eq!(machine.state, State::OauthInProgress);
         let action = feed(
             &mut machine,
@@ -1304,7 +1401,7 @@ mod tests {
             oauth_discovery_fn: Some(discovery_fn),
             ..Opts::default()
         };
-        let mut machine = auth_machine(options);
+        let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         let action = feed(
             &mut machine,
@@ -1312,18 +1409,14 @@ mod tests {
             msg_type::AUTHENTICATION,
             &sasl_payload(&["OAUTHBEARER"]),
         );
-        assert!(matches!(action, Ok(Action::Write)));
+        assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
         assert_eq!(
             buffer_set.write_buffer,
             oauth_initial_response_message("token-abc.def_ghi")
         );
-        assert_eq!(machine.state, State::OauthInProgressRead);
+        assert_eq!(machine.state, State::OauthInProgress);
         assert!(machine.scram_client.is_none());
 
-        assert!(matches!(
-            machine.step(&mut buffer_set),
-            Ok(Action::ReadMessage)
-        ));
         assert_eq!(machine.state, State::OauthInProgress);
 
         let ok_action = feed(
@@ -1347,16 +1440,12 @@ mod tests {
         };
         let mut buffer_set = BufferSet::new();
         let (mut machine, action) =
-            oauth_rejected_machine(options, &mut buffer_set, OAUTH_ERROR_JSON.as_bytes());
-        assert!(matches!(action, Ok(Action::Write)));
+            oauth_rejected_machine(&options, &mut buffer_set, OAUTH_ERROR_JSON.as_bytes());
+        assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
         assert_eq!(buffer_set.write_buffer, password_message(b"\x01"));
-        assert_eq!(machine.state, State::OauthFailedRead);
+        assert_eq!(machine.state, State::OauthFailed);
         assert_eq!(*discovery_calls.lock().unwrap(), vec![OAUTH_ERROR_JSON]);
 
-        assert!(matches!(
-            machine.step(&mut buffer_set),
-            Ok(Action::ReadMessage)
-        ));
         assert_eq!(machine.state, State::OauthFailed);
 
         let err = feed(
@@ -1383,13 +1472,9 @@ mod tests {
         for error_json in [OAUTH_ERROR_JSON.as_bytes(), b"", b"{}"] {
             let mut buffer_set = BufferSet::new();
             let (mut machine, action) =
-                oauth_rejected_machine(options.clone(), &mut buffer_set, error_json);
-            assert!(matches!(action, Ok(Action::Write)));
+                oauth_rejected_machine(&options, &mut buffer_set, error_json);
+            assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
             assert_eq!(buffer_set.write_buffer, password_message(b"\x01"));
-            assert!(matches!(
-                machine.step(&mut buffer_set),
-                Ok(Action::ReadMessage)
-            ));
             let err = feed(
                 &mut machine,
                 &mut buffer_set,
@@ -1409,12 +1494,8 @@ mod tests {
         };
         let mut buffer_set = BufferSet::new();
         let (mut machine, action) =
-            oauth_rejected_machine(options, &mut buffer_set, OAUTH_ERROR_JSON.as_bytes());
-        assert!(matches!(action, Ok(Action::Write)));
-        assert!(matches!(
-            machine.step(&mut buffer_set),
-            Ok(Action::ReadMessage)
-        ));
+            oauth_rejected_machine(&options, &mut buffer_set, OAUTH_ERROR_JSON.as_bytes());
+        assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
         let err = feed(
             &mut machine,
             &mut buffer_set,
@@ -1439,7 +1520,7 @@ mod tests {
         };
         for error_json in [&b"\xff\xfe"[..], b"{\"status\":\"\xc3\x28\"}"] {
             let mut buffer_set = BufferSet::new();
-            let (_, action) = oauth_rejected_machine(options.clone(), &mut buffer_set, error_json);
+            let (_, action) = oauth_rejected_machine(&options, &mut buffer_set, error_json);
             let err = action.unwrap_err();
             assert!(matches!(&err, Error::Auth(_)), "{err}");
         }
@@ -1453,7 +1534,7 @@ mod tests {
             oauth_bearer_token_fn: Some(Arc::new(|| Err(Error::Auth("issuer unreachable".into())))),
             ..Opts::default()
         };
-        let mut machine = auth_machine(options);
+        let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         let err = feed(
             &mut machine,
@@ -1482,7 +1563,7 @@ mod tests {
         };
 
         for attempt in 0..2 {
-            let mut machine = auth_machine(options.clone());
+            let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             feed(
                 &mut machine,
@@ -1495,7 +1576,6 @@ mod tests {
                 buffer_set.write_buffer,
                 oauth_initial_response_message(&format!("tok{attempt}"))
             );
-            machine.step(&mut buffer_set).unwrap();
             feed(
                 &mut machine,
                 &mut buffer_set,
@@ -1515,7 +1595,7 @@ mod tests {
             oauth_discovery_fn: Some(discovery_fn),
             ..Opts::default()
         };
-        let mut machine = auth_machine(options);
+        let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         let action = feed(
             &mut machine,
@@ -1523,28 +1603,20 @@ mod tests {
             msg_type::AUTHENTICATION,
             &sasl_payload(&["OAUTHBEARER"]),
         );
-        assert!(matches!(action, Ok(Action::Write)));
+        assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
         assert_eq!(buffer_set.write_buffer, oauth_message_with_auth(""));
         assert!(discovery_calls.lock().unwrap().is_empty());
 
-        assert!(matches!(
-            machine.step(&mut buffer_set),
-            Ok(Action::ReadMessage)
-        ));
         let rejected_action = feed(
             &mut machine,
             &mut buffer_set,
             msg_type::AUTHENTICATION,
             &auth_payload(11, OAUTH_ERROR_JSON.as_bytes()),
         );
-        assert!(matches!(rejected_action, Ok(Action::Write)));
+        assert!(matches!(rejected_action, Ok(Action::WriteAndReadMessage)));
         assert_eq!(buffer_set.write_buffer, password_message(b"\x01"));
         assert_eq!(*discovery_calls.lock().unwrap(), [OAUTH_ERROR_JSON]);
 
-        assert!(matches!(
-            machine.step(&mut buffer_set),
-            Ok(Action::ReadMessage)
-        ));
         let err = feed(
             &mut machine,
             &mut buffer_set,
@@ -1561,7 +1633,7 @@ mod tests {
             oauth_bearer_token_fn: Some(Arc::new(|| Ok("".into()))),
             ..Opts::default()
         };
-        let mut machine = auth_machine(options);
+        let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         let action = feed(
             &mut machine,
@@ -1569,9 +1641,9 @@ mod tests {
             msg_type::AUTHENTICATION,
             &sasl_payload(&["OAUTHBEARER"]),
         );
-        assert!(matches!(action, Ok(Action::Write)));
+        assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
         assert_eq!(buffer_set.write_buffer, oauth_initial_response_message(""));
-        assert_eq!(machine.state, State::OauthInProgressRead);
+        assert_eq!(machine.state, State::OauthInProgress);
     }
 
     #[test]
@@ -1583,7 +1655,7 @@ mod tests {
                 ..Opts::default()
             },
         ] {
-            let mut machine = auth_machine(options);
+            let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             let err = feed(
                 &mut machine,
@@ -1612,7 +1684,7 @@ mod tests {
             })),
             ..Opts::default()
         };
-        let mut machine = auth_machine(options);
+        let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         let action = feed(
             &mut machine,
@@ -1620,8 +1692,8 @@ mod tests {
             msg_type::AUTHENTICATION,
             &sasl_payload(&["SCRAM-SHA-256"]),
         );
-        assert!(matches!(action, Ok(Action::Write)));
-        assert_eq!(machine.state, State::SaslInProgressRead);
+        assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
+        assert_eq!(machine.state, State::SaslInProgress);
         assert!(machine.scram_client.is_some());
         assert!(buffer_set.write_buffer[5..].starts_with(b"SCRAM-SHA-256\0"));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -1631,14 +1703,18 @@ mod tests {
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap()
     }
 
-    fn start_sasl(
-        encoded_certificate: Option<&str>,
-        mechanisms: &[&str],
-    ) -> (ConnectionStateMachine, BufferSet) {
-        let options = Opts {
+    fn secret_password_opts() -> Opts {
+        Opts {
             password: Some("secret".into()),
             ..Opts::default()
-        };
+        }
+    }
+
+    fn start_sasl<'a>(
+        options: &'a Opts,
+        encoded_certificate: Option<&str>,
+        mechanisms: &[&str],
+    ) -> (ConnectionStateMachine<'a>, BufferSet) {
         let mut machine = auth_machine(options);
         if let Some(encoded_certificate) = encoded_certificate {
             machine.set_server_certificate_der(decode_base64(encoded_certificate));
@@ -1650,8 +1726,8 @@ mod tests {
             msg_type::AUTHENTICATION,
             &sasl_payload(mechanisms),
         );
-        assert!(matches!(action, Ok(Action::Write)));
-        assert_eq!(machine.state, State::SaslInProgressRead);
+        assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
+        assert_eq!(machine.state, State::SaslInProgress);
         assert!(machine.scram_client.is_some());
         (machine, buffer_set)
     }
@@ -1677,7 +1753,8 @@ mod tests {
             &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"],
             &["SCRAM-SHA-256"],
         ] {
-            let (_, buffer_set) = start_sasl(None, mechanisms);
+            let options = secret_password_opts();
+            let (_, buffer_set) = start_sasl(&options, None, mechanisms);
             let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
             assert_eq!(mechanism, "SCRAM-SHA-256");
             assert!(client_first.starts_with("n,,n=,r="), "{client_first}");
@@ -1694,7 +1771,8 @@ mod tests {
             &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"],
             &["SCRAM-SHA-256-PLUS"],
         ] {
-            let (_, buffer_set) = start_sasl(Some(ECDSA_SHA256_CERTIFICATE), mechanisms);
+            let options = secret_password_opts();
+            let (_, buffer_set) = start_sasl(&options, Some(ECDSA_SHA256_CERTIFICATE), mechanisms);
             let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
             assert_eq!(mechanism, "SCRAM-SHA-256-PLUS");
             assert!(
@@ -1709,7 +1787,9 @@ mod tests {
     fn sasl_with_server_certificate_without_plus_offered_uses_unadvertised_channel_binding() {
         use crate::tls::tests::ECDSA_SHA256_CERTIFICATE;
 
-        let (_, buffer_set) = start_sasl(Some(ECDSA_SHA256_CERTIFICATE), &["SCRAM-SHA-256"]);
+        let options = secret_password_opts();
+        let (_, buffer_set) =
+            start_sasl(&options, Some(ECDSA_SHA256_CERTIFICATE), &["SCRAM-SHA-256"]);
         let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
         assert_eq!(mechanism, "SCRAM-SHA-256");
         assert!(client_first.starts_with("y,,n=,r="), "{client_first}");
@@ -1721,7 +1801,9 @@ mod tests {
         use crate::tls::tests::ED25519_CERTIFICATE;
 
         for encoded_certificate in [ED25519_CERTIFICATE, "bm90IGEgY2VydGlmaWNhdGU="] {
+            let options = secret_password_opts();
             let (_, buffer_set) = start_sasl(
+                &options,
                 Some(encoded_certificate),
                 &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
             );
@@ -1740,7 +1822,7 @@ mod tests {
             password: Some("secret".into()),
             ..Opts::default()
         };
-        let mut machine = auth_machine(options);
+        let mut machine = auth_machine(&options);
         machine.set_server_certificate_der(decode_base64(ED25519_CERTIFICATE));
         let mut buffer_set = BufferSet::new();
         let err = feed(
@@ -1762,7 +1844,9 @@ mod tests {
     fn sasl_plus_client_final_binds_server_end_point() {
         use crate::tls::tests::{ECDSA_SHA256_CERTIFICATE, ECDSA_SHA256_END_POINT};
 
+        let options = secret_password_opts();
         let (mut machine, mut buffer_set) = start_sasl(
+            &options,
             Some(ECDSA_SHA256_CERTIFICATE),
             &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
         );
@@ -1771,10 +1855,6 @@ mod tests {
             .strip_prefix("p=tls-server-end-point,,n=,r=")
             .unwrap();
 
-        assert!(matches!(
-            machine.step(&mut buffer_set),
-            Ok(Action::ReadMessage)
-        ));
         assert_eq!(machine.state, State::SaslInProgress);
 
         let server_first = format!("r={client_nonce}server,s=c2FsdA==,i=4096");
@@ -1784,8 +1864,8 @@ mod tests {
             msg_type::AUTHENTICATION,
             &auth_payload(11, server_first.as_bytes()),
         );
-        assert!(matches!(action, Ok(Action::Write)));
-        assert_eq!(machine.state, State::SaslInProgressRead);
+        assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
+        assert_eq!(machine.state, State::SaslInProgress);
 
         assert_eq!(buffer_set.write_buffer[0], b'p');
         let client_final = std::str::from_utf8(&buffer_set.write_buffer[5..]).unwrap();
@@ -1811,16 +1891,19 @@ mod tests {
 
     const CHANNEL_BINDING_TLS_MODES: [TlsMode; 2] = [TlsMode::ChannelBinding, TlsMode::Hardened];
 
-    fn tls_mode_auth_machine(
-        tls_mode: TlsMode,
-        encoded_certificate: Option<&str>,
-    ) -> ConnectionStateMachine {
-        let options = Opts {
+    fn tls_mode_opts(tls_mode: TlsMode) -> Opts {
+        Opts {
             password: Some("secret".into()),
             oauth_bearer_token_fn: Some(Arc::new(|| Ok("token".into()))),
             tls_mode,
             ..Opts::default()
-        };
+        }
+    }
+
+    fn tls_mode_auth_machine<'a>(
+        options: &'a Opts,
+        encoded_certificate: Option<&str>,
+    ) -> ConnectionStateMachine<'a> {
         let mut machine = auth_machine(options);
         if let Some(encoded_certificate) = encoded_certificate {
             machine.set_server_certificate_der(decode_base64(encoded_certificate));
@@ -1859,7 +1942,8 @@ mod tests {
         ];
         for tls_mode in CHANNEL_BINDING_TLS_MODES {
             for payload in &payloads {
-                let mut machine = tls_mode_auth_machine(tls_mode, None);
+                let options = tls_mode_opts(tls_mode);
+                let mut machine = tls_mode_auth_machine(&options, None);
                 let mut buffer_set = BufferSet::new();
                 let result = feed(
                     &mut machine,
@@ -1892,7 +1976,8 @@ mod tests {
                     "SCRAM-SHA-1-PLUS",
                 ],
             ] {
-                let mut machine = tls_mode_auth_machine(tls_mode, None);
+                let options = tls_mode_opts(tls_mode);
+                let mut machine = tls_mode_auth_machine(&options, None);
                 let mut buffer_set = BufferSet::new();
                 let result = feed(
                     &mut machine,
@@ -1918,7 +2003,8 @@ mod tests {
                 &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
                 &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS", "OAUTHBEARER"],
             ] {
-                let mut machine = tls_mode_auth_machine(tls_mode, None);
+                let options = tls_mode_opts(tls_mode);
+                let mut machine = tls_mode_auth_machine(&options, None);
                 let mut buffer_set = BufferSet::new();
                 let result = feed(
                     &mut machine,
@@ -1943,7 +2029,8 @@ mod tests {
 
         for tls_mode in CHANNEL_BINDING_TLS_MODES {
             for encoded_certificate in [ED25519_CERTIFICATE, "bm90IGEgY2VydGlmaWNhdGU=", ""] {
-                let mut machine = tls_mode_auth_machine(tls_mode, Some(encoded_certificate));
+                let options = tls_mode_opts(tls_mode);
+                let mut machine = tls_mode_auth_machine(&options, Some(encoded_certificate));
                 let mut buffer_set = BufferSet::new();
                 let result = feed(
                     &mut machine,
@@ -1968,7 +2055,8 @@ mod tests {
 
         for tls_mode in CHANNEL_BINDING_TLS_MODES {
             for mechanisms in [&["SCRAM-SHA-256"][..], &["OAUTHBEARER"], &[]] {
-                let mut machine = tls_mode_auth_machine(tls_mode, Some(ECDSA_SHA256_CERTIFICATE));
+                let options = tls_mode_opts(tls_mode);
+                let mut machine = tls_mode_auth_machine(&options, Some(ECDSA_SHA256_CERTIFICATE));
                 let mut buffer_set = BufferSet::new();
                 let result = feed(
                     &mut machine,
@@ -1997,7 +2085,8 @@ mod tests {
                 &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"],
                 &["OAUTHBEARER", "SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
             ] {
-                let mut machine = tls_mode_auth_machine(tls_mode, Some(ECDSA_SHA256_CERTIFICATE));
+                let options = tls_mode_opts(tls_mode);
+                let mut machine = tls_mode_auth_machine(&options, Some(ECDSA_SHA256_CERTIFICATE));
                 let mut buffer_set = BufferSet::new();
                 let action = feed(
                     &mut machine,
@@ -2005,8 +2094,11 @@ mod tests {
                     msg_type::AUTHENTICATION,
                     &sasl_payload(mechanisms),
                 );
-                assert!(matches!(action, Ok(Action::Write)), "{tls_mode:?}");
-                assert_eq!(machine.state, State::SaslInProgressRead);
+                assert!(
+                    matches!(action, Ok(Action::WriteAndReadMessage)),
+                    "{tls_mode:?}"
+                );
+                assert_eq!(machine.state, State::SaslInProgress);
                 assert!(machine.scram_client.is_some());
                 let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
                 assert_eq!(mechanism, "SCRAM-SHA-256-PLUS");
@@ -2014,20 +2106,16 @@ mod tests {
                     client_first.starts_with("p=tls-server-end-point,,n=,r="),
                     "{client_first}"
                 );
-                assert!(matches!(
-                    machine.step(&mut buffer_set),
-                    Ok(Action::ReadMessage)
-                ));
                 assert_eq!(machine.state, State::SaslInProgress);
             }
         }
     }
 
     #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
-    fn scram_plus_after_client_first(tls_mode: TlsMode) -> (ConnectionStateMachine, BufferSet) {
+    fn scram_plus_after_client_first(options: &Opts) -> (ConnectionStateMachine<'_>, BufferSet) {
         use crate::tls::tests::ECDSA_SHA256_CERTIFICATE;
 
-        let mut machine = tls_mode_auth_machine(tls_mode, Some(ECDSA_SHA256_CERTIFICATE));
+        let mut machine = tls_mode_auth_machine(options, Some(ECDSA_SHA256_CERTIFICATE));
         let mut buffer_set = BufferSet::new();
         feed(
             &mut machine,
@@ -2036,17 +2124,13 @@ mod tests {
             &sasl_payload(&["SCRAM-SHA-256-PLUS"]),
         )
         .unwrap();
-        assert!(matches!(
-            machine.step(&mut buffer_set),
-            Ok(Action::ReadMessage)
-        ));
         assert_eq!(machine.state, State::SaslInProgress);
         (machine, buffer_set)
     }
 
     #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
-    fn scram_plus_after_client_final(tls_mode: TlsMode) -> (ConnectionStateMachine, BufferSet) {
-        let (mut machine, mut buffer_set) = scram_plus_after_client_first(tls_mode);
+    fn scram_plus_after_client_final(options: &Opts) -> (ConnectionStateMachine<'_>, BufferSet) {
+        let (mut machine, mut buffer_set) = scram_plus_after_client_first(options);
         let (_, client_first) = sasl_initial_response(&buffer_set.write_buffer);
         let client_nonce = client_first
             .strip_prefix("p=tls-server-end-point,,n=,r=")
@@ -2060,11 +2144,7 @@ mod tests {
                 msg_type::AUTHENTICATION,
                 &auth_payload(11, server_first.as_bytes()),
             ),
-            Ok(Action::Write)
-        ));
-        assert!(matches!(
-            machine.step(&mut buffer_set),
-            Ok(Action::ReadMessage)
+            Ok(Action::WriteAndReadMessage)
         ));
         assert_eq!(machine.state, State::SaslInProgress);
         (machine, buffer_set)
@@ -2074,7 +2154,8 @@ mod tests {
     #[test]
     fn channel_binding_rejects_authentication_ok_after_client_first() {
         for tls_mode in CHANNEL_BINDING_TLS_MODES {
-            let (mut machine, mut buffer_set) = scram_plus_after_client_first(tls_mode);
+            let options = tls_mode_opts(tls_mode);
+            let (mut machine, mut buffer_set) = scram_plus_after_client_first(&options);
             feed(
                 &mut machine,
                 &mut buffer_set,
@@ -2090,7 +2171,8 @@ mod tests {
     #[test]
     fn channel_binding_rejects_authentication_ok_after_client_final() {
         for tls_mode in CHANNEL_BINDING_TLS_MODES {
-            let (mut machine, mut buffer_set) = scram_plus_after_client_final(tls_mode);
+            let options = tls_mode_opts(tls_mode);
+            let (mut machine, mut buffer_set) = scram_plus_after_client_final(&options);
             feed(
                 &mut machine,
                 &mut buffer_set,
@@ -2106,7 +2188,8 @@ mod tests {
     #[test]
     fn channel_binding_rejects_forged_server_final() {
         for tls_mode in CHANNEL_BINDING_TLS_MODES {
-            let (mut machine, mut buffer_set) = scram_plus_after_client_final(tls_mode);
+            let options = tls_mode_opts(tls_mode);
+            let (mut machine, mut buffer_set) = scram_plus_after_client_final(&options);
             let err = feed(
                 &mut machine,
                 &mut buffer_set,
@@ -2129,7 +2212,7 @@ mod tests {
                 tls_mode,
                 ..Opts::default()
             };
-            let mut machine = auth_machine(options);
+            let mut machine = auth_machine(&options);
             machine.set_server_certificate_der(decode_base64(ECDSA_SHA256_CERTIFICATE));
             let mut buffer_set = BufferSet::new();
             let result = feed(
@@ -2145,7 +2228,8 @@ mod tests {
     #[test]
     fn non_channel_binding_tls_mode_accepts_authentication_ok() {
         for tls_mode in [TlsMode::Insecure, TlsMode::Pki] {
-            let mut machine = tls_mode_auth_machine(tls_mode, None);
+            let options = tls_mode_opts(tls_mode);
+            let mut machine = tls_mode_auth_machine(&options, None);
             let mut buffer_set = BufferSet::new();
             let action = feed(
                 &mut machine,
@@ -2161,7 +2245,8 @@ mod tests {
     #[test]
     fn non_channel_binding_tls_mode_accepts_password_authentication() {
         for tls_mode in [TlsMode::Insecure, TlsMode::Pki] {
-            let mut cleartext_machine = tls_mode_auth_machine(tls_mode, None);
+            let options = tls_mode_opts(tls_mode);
+            let mut cleartext_machine = tls_mode_auth_machine(&options, None);
             let mut cleartext_buffer_set = BufferSet::new();
             let cleartext_action = feed(
                 &mut cleartext_machine,
@@ -2170,7 +2255,7 @@ mod tests {
                 &auth_payload(3, &[]),
             );
             assert!(
-                matches!(cleartext_action, Ok(Action::Write)),
+                matches!(cleartext_action, Ok(Action::WriteAndReadMessage)),
                 "{tls_mode:?}"
             );
             assert_eq!(
@@ -2178,7 +2263,7 @@ mod tests {
                 password_message(b"secret\0")
             );
 
-            let mut md5_machine = tls_mode_auth_machine(tls_mode, None);
+            let mut md5_machine = tls_mode_auth_machine(&options, None);
             let mut md5_buffer_set = BufferSet::new();
             let md5_action = feed(
                 &mut md5_machine,
@@ -2186,8 +2271,11 @@ mod tests {
                 msg_type::AUTHENTICATION,
                 &auth_payload(5, &[0x01, 0x02, 0x03, 0x04]),
             );
-            assert!(matches!(md5_action, Ok(Action::Write)), "{tls_mode:?}");
-            assert_eq!(md5_machine.state, State::WaitingAuthResultRead);
+            assert!(
+                matches!(md5_action, Ok(Action::WriteAndReadMessage)),
+                "{tls_mode:?}"
+            );
+            assert_eq!(md5_machine.state, State::WaitingAuthResult);
         }
     }
 
@@ -2198,7 +2286,8 @@ mod tests {
                 &["SCRAM-SHA-256"][..],
                 &["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"],
             ] {
-                let mut machine = tls_mode_auth_machine(tls_mode, None);
+                let options = tls_mode_opts(tls_mode);
+                let mut machine = tls_mode_auth_machine(&options, None);
                 let mut buffer_set = BufferSet::new();
                 let action = feed(
                     &mut machine,
@@ -2206,13 +2295,17 @@ mod tests {
                     msg_type::AUTHENTICATION,
                     &sasl_payload(mechanisms),
                 );
-                assert!(matches!(action, Ok(Action::Write)), "{tls_mode:?}");
+                assert!(
+                    matches!(action, Ok(Action::WriteAndReadMessage)),
+                    "{tls_mode:?}"
+                );
                 let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
                 assert_eq!(mechanism, "SCRAM-SHA-256");
                 assert!(client_first.starts_with("n,,n=,r="), "{client_first}");
             }
 
-            let mut machine = tls_mode_auth_machine(tls_mode, None);
+            let options = tls_mode_opts(tls_mode);
+            let mut machine = tls_mode_auth_machine(&options, None);
             let mut buffer_set = BufferSet::new();
             let action = feed(
                 &mut machine,
@@ -2220,12 +2313,15 @@ mod tests {
                 msg_type::AUTHENTICATION,
                 &sasl_payload(&["OAUTHBEARER"]),
             );
-            assert!(matches!(action, Ok(Action::Write)), "{tls_mode:?}");
+            assert!(
+                matches!(action, Ok(Action::WriteAndReadMessage)),
+                "{tls_mode:?}"
+            );
             assert_eq!(
                 buffer_set.write_buffer,
                 oauth_initial_response_message("token")
             );
-            assert_eq!(machine.state, State::OauthInProgressRead);
+            assert_eq!(machine.state, State::OauthInProgress);
         }
     }
 
@@ -2254,7 +2350,8 @@ mod tests {
                 "n,,n=,r=",
             ),
         ] {
-            let mut machine = tls_mode_auth_machine(TlsMode::Pki, Some(encoded_certificate));
+            let options = tls_mode_opts(TlsMode::Pki);
+            let mut machine = tls_mode_auth_machine(&options, Some(encoded_certificate));
             let mut buffer_set = BufferSet::new();
             let action = feed(
                 &mut machine,
@@ -2262,10 +2359,47 @@ mod tests {
                 msg_type::AUTHENTICATION,
                 &sasl_payload(mechanisms),
             );
-            assert!(matches!(action, Ok(Action::Write)));
+            assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
             let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
             assert_eq!(mechanism, expected_mechanism);
             assert!(client_first.starts_with(expected_prefix), "{client_first}");
         }
+    }
+
+    #[test]
+    fn ready_for_query_rejects_invalid_status_byte() {
+        for status in [0, b'i', b'X', 0xFF] {
+            let options = Opts::default();
+            let mut machine = auth_machine(&options);
+            machine.state = State::WaitingReady;
+            let err = feed(
+                &mut machine,
+                &mut BufferSet::new(),
+                msg_type::READY_FOR_QUERY,
+                &[status],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::LibraryBug(message) if message.starts_with("ReadyForQuery: invalid transaction status byte")),
+                "{status}: {err}"
+            );
+            assert_ne!(machine.state, State::Finished);
+        }
+    }
+
+    #[test]
+    fn ready_for_query_idle_finishes_startup() {
+        let options = Opts::default();
+        let mut machine = auth_machine(&options);
+        machine.state = State::WaitingReady;
+        let action = feed(
+            &mut machine,
+            &mut BufferSet::new(),
+            msg_type::READY_FOR_QUERY,
+            b"I",
+        );
+        assert!(matches!(action, Ok(Action::Finished)));
+        assert_eq!(machine.state, State::Finished);
+        assert_eq!(machine.transaction_status, TransactionStatus::Idle);
     }
 }

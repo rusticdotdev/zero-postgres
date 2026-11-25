@@ -163,8 +163,13 @@ impl ReadyForQuery {
     }
 
     /// Get the transaction status.
-    pub fn transaction_status(&self) -> Option<TransactionStatus> {
-        TransactionStatus::from_byte(self.status)
+    pub fn transaction_status(&self) -> Result<TransactionStatus> {
+        TransactionStatus::from_byte(self.status).ok_or_else(|| {
+            Error::LibraryBug(format!(
+                "ReadyForQuery: invalid transaction status byte {}",
+                self.status
+            ))
+        })
     }
 }
 
@@ -204,9 +209,14 @@ pub struct NegotiateProtocolVersion<'a> {
 
 impl<'a> NegotiateProtocolVersion<'a> {
     /// Parse a NegotiateProtocolVersion message from payload bytes.
-    pub fn parse(payload: &'a [u8]) -> Result<Self> {
+    pub fn parse(payload: &'a [u8], sent_option_count: usize) -> Result<Self> {
         let (newest_version, rest) = read_i32(payload)?;
         let (num_options, mut rest) = read_u32(rest)?;
+        if num_options as usize > sent_option_count {
+            return Err(Error::LibraryBug(format!(
+                "NegotiateProtocolVersion: server rejected {num_options} protocol options but only {sent_option_count} were sent"
+            )));
+        }
 
         let mut unrecognized_options = Vec::with_capacity(num_options as usize);
         for _ in 0..num_options {
@@ -237,5 +247,117 @@ mod tests {
         assert!(debug.contains("secret_key: ***"), "{debug}");
         assert!(!debug.contains("222, 173, 190, 239"), "{debug}");
         assert!(!debug.contains("222"), "{debug}");
+    }
+
+    fn negotiate_payload(newest_version: i32, num_options: u32, options: &[&[u8]]) -> Vec<u8> {
+        let mut payload = newest_version.to_be_bytes().to_vec();
+        payload.extend_from_slice(&num_options.to_be_bytes());
+        for option in options {
+            payload.extend_from_slice(option);
+            payload.push(0);
+        }
+        payload
+    }
+
+    fn is_option_count_rejection(err: &Error) -> bool {
+        matches!(err, Error::LibraryBug(message) if message.starts_with("NegotiateProtocolVersion: server rejected"))
+    }
+
+    #[test]
+    fn negotiate_parse_accepts_zero_options() {
+        for sent_option_count in [0, 1, 5] {
+            let payload = negotiate_payload(0x0003_0000, 0, &[]);
+            let negotiate = NegotiateProtocolVersion::parse(&payload, sent_option_count).unwrap();
+            assert_eq!(negotiate.newest_version, 0x0003_0000);
+            assert!(negotiate.unrecognized_options.is_empty());
+        }
+    }
+
+    #[test]
+    fn negotiate_parse_returns_options_in_order() {
+        let payload = negotiate_payload(
+            0x0003_0002,
+            3,
+            &[b"_pq_.b", b"_pq_.a", b"_pq_.\xED\x95\x9C"],
+        );
+        for sent_option_count in [3, 4] {
+            let negotiate = NegotiateProtocolVersion::parse(&payload, sent_option_count).unwrap();
+            assert_eq!(negotiate.newest_version, 0x0003_0002);
+            assert_eq!(
+                negotiate.unrecognized_options,
+                ["_pq_.b", "_pq_.a", "_pq_.\u{D55C}"]
+            );
+        }
+
+        let empty_name_payload = negotiate_payload(0x0003_0000, 1, &[b""]);
+        let negotiate = NegotiateProtocolVersion::parse(&empty_name_payload, 1).unwrap();
+        assert_eq!(negotiate.unrecognized_options, [""]);
+    }
+
+    #[test]
+    fn negotiate_parse_rejects_more_options_than_sent() {
+        for (num_options, sent_option_count) in [(1, 0), (2, 1), (3, 2), (0x8000_0000, 7)] {
+            let options: Vec<&[u8]> = vec![b"_pq_.x"; num_options.min(3) as usize];
+            let payload = negotiate_payload(0x0003_0000, num_options, &options);
+            let err = NegotiateProtocolVersion::parse(&payload, sent_option_count).unwrap_err();
+            assert!(
+                is_option_count_rejection(&err),
+                "{num_options} {sent_option_count}: {err}"
+            );
+            assert!(err.to_string().contains(&num_options.to_string()), "{err}");
+        }
+    }
+
+    #[test]
+    fn negotiate_parse_rejects_u32_max_option_count_before_allocating() {
+        for sent_option_count in [0, 1, u16::MAX as usize] {
+            let payload = negotiate_payload(0x0003_0000, u32::MAX, &[]);
+            let err = NegotiateProtocolVersion::parse(&payload, sent_option_count).unwrap_err();
+            assert!(is_option_count_rejection(&err), "{err}");
+            assert!(err.to_string().contains("4294967295"), "{err}");
+        }
+    }
+
+    #[test]
+    fn negotiate_parse_rejects_malformed_payload_within_bound() {
+        let mut no_terminator = negotiate_payload(0x0003_0000, 1, &[]);
+        no_terminator.extend_from_slice(b"_pq_.x");
+        let cases: [(Vec<u8>, usize); 6] = [
+            (negotiate_payload(0x0003_0000, 2, &[b"_pq_.x"]), 2),
+            (negotiate_payload(0x0003_0000, 1, &[]), 1),
+            (negotiate_payload(0x0003_0000, 3, &[]), 3),
+            (no_terminator, 1),
+            (negotiate_payload(0x0003_0000, 1, &[b"_pq_.\xFF"]), 1),
+            (0x0003_0000i32.to_be_bytes().to_vec(), 0),
+        ];
+        for (payload, sent_option_count) in cases {
+            let err = NegotiateProtocolVersion::parse(&payload, sent_option_count).unwrap_err();
+            assert!(matches!(err, Error::LibraryBug(_)), "{payload:?}: {err}");
+            assert!(!is_option_count_rejection(&err), "{payload:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn ready_for_query_maps_valid_status_bytes() {
+        for (payload, expected) in [
+            (b"I", TransactionStatus::Idle),
+            (b"T", TransactionStatus::InTransaction),
+            (b"E", TransactionStatus::Failed),
+        ] {
+            let ready = ReadyForQuery::parse(payload).unwrap();
+            assert_eq!(ready.transaction_status().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn ready_for_query_rejects_invalid_status_bytes() {
+        for payload in [b"\0", b"i", b"t", b"e", b"X", b"\x7F", b"\xFF"] {
+            let ready = ReadyForQuery::parse(payload).unwrap();
+            let err = ready.transaction_status().unwrap_err();
+            assert!(
+                matches!(&err, Error::LibraryBug(message) if message.starts_with("ReadyForQuery: invalid transaction status byte")),
+                "{payload:?}: {err}"
+            );
+        }
     }
 }

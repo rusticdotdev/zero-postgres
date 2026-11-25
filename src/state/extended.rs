@@ -346,7 +346,7 @@ impl<'a, H: ExtendedHandler> ExtendedQueryStateMachine<'a, H> {
             }
             msg_type::READY_FOR_QUERY => {
                 let ready = ReadyForQuery::parse(payload)?;
-                self.transaction_status = ready.transaction_status().unwrap_or_default();
+                self.transaction_status = ready.transaction_status()?;
                 self.state = State::Finished;
                 Ok(Action::Finished)
             }
@@ -364,7 +364,7 @@ impl<'a, H: ExtendedHandler> ExtendedQueryStateMachine<'a, H> {
         match type_byte {
             msg_type::READY_FOR_QUERY => {
                 let ready = ReadyForQuery::parse(payload)?;
-                self.transaction_status = ready.transaction_status().unwrap_or_default();
+                self.transaction_status = ready.transaction_status()?;
                 self.state = State::Finished;
                 if let Some(err) = self.pending_error.take() {
                     Ok(Action::Error(err))
@@ -720,7 +720,7 @@ impl BatchStateMachine {
                     }
                     msg_type::READY_FOR_QUERY => {
                         let ready = ReadyForQuery::parse(&buffer_set.read_buffer)?;
-                        self.transaction_status = ready.transaction_status().unwrap_or_default();
+                        self.transaction_status = ready.transaction_status()?;
                         self.state = BatchState::Finished;
                         if let Some(err) = self.pending_error.take() {
                             Ok(Action::Error(err))

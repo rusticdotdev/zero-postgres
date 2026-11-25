@@ -290,7 +290,7 @@ impl<'a> Pipeline<'a> {
 
             if type_byte == msg_type::READY_FOR_QUERY {
                 let ready = ReadyForQuery::parse(&self.conn.buffer_set.read_buffer)?;
-                self.conn.transaction_status = ready.transaction_status().unwrap_or_default();
+                self.conn.transaction_status = ready.transaction_status()?;
                 return Ok(());
             }
         }

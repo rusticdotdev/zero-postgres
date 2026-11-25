@@ -125,7 +125,7 @@ impl BatchPrepareStateMachine {
                 }
                 msg_type::READY_FOR_QUERY => {
                     let ready = ReadyForQuery::parse(&buffer_set.read_buffer)?;
-                    self.transaction_status = ready.transaction_status().unwrap_or_default();
+                    self.transaction_status = ready.transaction_status()?;
                     self.state = State::Finished;
                     Ok(Action::Finished)
                 }
