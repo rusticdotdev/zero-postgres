@@ -1,5 +1,7 @@
 //! Startup and termination messages.
 
+use std::ffi::CStr;
+
 use crate::protocol::codec::MessageBuilder;
 
 /// Protocol version 3.0 (0x00030000)
@@ -29,18 +31,18 @@ pub fn write_ssl_request(buf: &mut Vec<u8>) {
 /// Parameters is a list of (name, value) pairs.
 /// Required: "user" - database username
 /// Optional: "database", "options", "replication", "client_encoding", etc.
-pub fn write_startup(buf: &mut Vec<u8>, params: &[(&str, &str)]) {
+pub fn write_startup(buf: &mut Vec<u8>, params: &[(&CStr, &CStr)]) {
     write_startup_with_version(buf, PROTOCOL_VERSION_3_2, params);
 }
 
 /// Write a StartupMessage with a specific protocol version.
-pub fn write_startup_with_version(buf: &mut Vec<u8>, version: i32, params: &[(&str, &str)]) {
+pub fn write_startup_with_version(buf: &mut Vec<u8>, version: i32, params: &[(&CStr, &CStr)]) {
     let mut msg = MessageBuilder::new_startup(buf);
     msg.write_i32(version);
 
     for (name, value) in params {
-        msg.write_cstr(name);
-        msg.write_cstr(value);
+        msg.write_bytes(name.to_bytes_with_nul());
+        msg.write_bytes(value.to_bytes_with_nul());
     }
 
     // Terminator
@@ -87,7 +89,7 @@ mod tests {
     #[test]
     fn startup() {
         let mut buf = Vec::new();
-        write_startup(&mut buf, &[("user", "postgres"), ("database", "test")]);
+        write_startup(&mut buf, &[(c"user", c"postgres"), (c"database", c"test")]);
 
         // Check length is at start
         let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -96,6 +98,23 @@ mod tests {
         // Check protocol version
         let version = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
         assert_eq!(version, PROTOCOL_VERSION_3_2);
+    }
+
+    #[test]
+    fn startup_bytes() {
+        let mut one_param = Vec::new();
+        write_startup(&mut one_param, &[(c"user", c"alice")]);
+        let mut one_param_expected = 20_i32.to_be_bytes().to_vec();
+        one_param_expected.extend_from_slice(&[0, 3, 0, 2]);
+        one_param_expected.extend_from_slice(b"user\0alice\0\0");
+        assert_eq!(one_param, one_param_expected);
+
+        let mut two_params = Vec::new();
+        write_startup(&mut two_params, &[(c"user", c"alice"), (c"database", c"")]);
+        let mut two_params_expected = 30_i32.to_be_bytes().to_vec();
+        two_params_expected.extend_from_slice(&[0, 3, 0, 2]);
+        two_params_expected.extend_from_slice(b"user\0alice\0database\0\0\0");
+        assert_eq!(two_params, two_params_expected);
     }
 
     #[test]

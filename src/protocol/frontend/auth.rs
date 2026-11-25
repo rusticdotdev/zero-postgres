@@ -26,14 +26,14 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 /// Compute MD5 password hash.
 ///
 /// PostgreSQL MD5 password format: "md5" + md5(md5(password + username) + salt)
-pub fn md5_password(username: &str, password: &str, salt: &[u8; 4]) -> String {
+pub fn md5_password(username: &[u8], password: &str, salt: &[u8; 4]) -> String {
     use md5::{Digest, Md5};
 
     // First hash: md5(password + username)
     let first_hash = {
         let mut hasher = Md5::new();
         hasher.update(password.as_bytes());
-        hasher.update(username.as_bytes());
+        hasher.update(username);
         hasher.finalize()
     };
     let first_hash_hex = lowercase_hex(&first_hash);
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn md5_password_hash() {
         // Test vector from PostgreSQL
-        let result = md5_password("postgres", "password", &[0x01, 0x02, 0x03, 0x04]);
+        let result = md5_password(b"postgres", "password", &[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(result, "md598511ceaec347a656f032c7f2a16ef17");
     }
 
