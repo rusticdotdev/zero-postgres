@@ -88,11 +88,12 @@ impl<'a> AuthenticationMessage<'a> {
 /// BackendKeyData message - contains process ID and secret key for cancellation.
 ///
 /// In protocol 3.2, the secret key is variable-length (4-256 bytes).
-#[derive(Debug, Clone)]
+#[derive(derive_more::Debug, Clone)]
 pub struct BackendKeyData {
     /// Process ID of the backend
     pid: u32,
     /// Secret key for cancellation (variable length in protocol 3.2)
+    #[debug("***")]
     secret_key: Vec<u8>,
 }
 
@@ -218,5 +219,23 @@ impl<'a> NegotiateProtocolVersion<'a> {
             newest_version,
             unrecognized_options,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_key_data_debug_hides_secret_key() {
+        let mut payload = 31337u32.to_be_bytes().to_vec();
+        payload.extend_from_slice(&[222, 173, 190, 239]);
+        let key_data = BackendKeyData::parse(&payload).unwrap();
+
+        let debug = format!("{key_data:?}");
+        assert!(debug.contains("pid: 31337"), "{debug}");
+        assert!(debug.contains("secret_key: ***"), "{debug}");
+        assert!(!debug.contains("222, 173, 190, 239"), "{debug}");
+        assert!(!debug.contains("222"), "{debug}");
     }
 }
