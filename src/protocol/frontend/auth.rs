@@ -81,8 +81,6 @@ pub struct ScramClient {
     channel_binding_data: Vec<u8>,
     /// Password
     password: String,
-    /// Server-first-message (stored for later)
-    server_first: Option<String>,
     /// Auth message for signature verification
     auth_message: Option<String>,
     /// Salted password for server signature verification
@@ -121,7 +119,6 @@ impl ScramClient {
             gs2_header,
             channel_binding_data: channel_binding_data.to_vec(),
             password: password.to_string(),
-            server_first: None,
             auth_message: None,
             salted_password: None,
         }
@@ -145,8 +142,6 @@ impl ScramClient {
         use hmac::{Hmac, KeyInit, Mac};
         use pbkdf2::pbkdf2_hmac;
         use sha2::{Digest, Sha256};
-
-        self.server_first = Some(server_first.to_string());
 
         // Parse server-first-message: r=<nonce>,s=<salt>,i=<iterations>
         let mut combined_nonce = None;
@@ -186,8 +181,6 @@ impl ScramClient {
             &mut salted_password,
         );
 
-        self.salted_password = Some(salted_password.clone());
-
         // ClientKey = HMAC(SaltedPassword, "Client Key")
         let client_key = {
             let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&salted_password)
@@ -195,6 +188,7 @@ impl ScramClient {
             mac.update(b"Client Key");
             mac.finalize().into_bytes()
         };
+        self.salted_password = Some(salted_password);
 
         // StoredKey = H(ClientKey)
         let stored_key = Sha256::digest(client_key);
@@ -212,7 +206,6 @@ impl ScramClient {
             server_first,
             client_final_without_proof
         );
-        self.auth_message = Some(auth_message.clone());
 
         // ClientSignature = HMAC(StoredKey, AuthMessage)
         let client_signature = {
@@ -221,6 +214,7 @@ impl ScramClient {
             mac.update(auth_message.as_bytes());
             mac.finalize().into_bytes()
         };
+        self.auth_message = Some(auth_message);
 
         // ClientProof = ClientKey XOR ClientSignature
         let mut client_proof = [0u8; 32];
