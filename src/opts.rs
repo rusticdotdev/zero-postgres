@@ -1,7 +1,7 @@
 //! Connection options.
 
 use std::borrow::Cow;
-use std::ffi::{CString, NulError};
+use std::ffi::{CStr, CString, NulError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,10 +99,10 @@ pub struct Opts {
     ///
     /// Default: `None`
     #[debug("{}", if password.is_some() { "Some(***)" } else { "None" })]
-    pub password: Option<String>,
+    pub password: Option<CString>,
 
     #[debug("{}", if password_fn.is_some() { "Some(..)" } else { "None" })]
-    pub password_fn: Option<Arc<dyn Fn() -> Result<String, Error> + Send + Sync>>,
+    pub password_fn: Option<Arc<dyn Fn() -> Result<CString, Error> + Send + Sync>>,
 
     #[debug("{}", if oauth_bearer_token_fn.is_some() { "Some(..)" } else { "None" })]
     pub oauth_bearer_token_fn:
@@ -182,7 +182,7 @@ pub struct Opts {
 }
 
 impl Opts {
-    pub(crate) fn get_password(&self) -> Result<Option<Cow<'_, str>>, Error> {
+    pub(crate) fn get_password(&self) -> Result<Option<Cow<'_, CStr>>, Error> {
         if let Some(password_fn) = &self.password_fn {
             return password_fn().map(|password| Some(Cow::Owned(password)));
         }
@@ -283,7 +283,10 @@ impl TryFrom<&Url> for Opts {
             host: url.host_str().unwrap_or("localhost").to_string(),
             port: url.port().unwrap_or(5432),
             user: percent_decode_cstring(url.username(), "user")?,
-            password: url.password().map(percent_decode).transpose()?,
+            password: url
+                .password()
+                .map(|password| percent_decode_cstring(password, "password"))
+                .transpose()?,
             database: match url.path().strip_prefix('/') {
                 Some(s) if !s.is_empty() => Some(percent_decode_cstring(s, "database")?),
                 _ => None,
@@ -415,13 +418,6 @@ fn percent_decode_cstring(s: &str, url_part: &str) -> Result<CString, Error> {
     Ok(cstring)
 }
 
-fn percent_decode(s: &str) -> Result<String, Error> {
-    percent_encoding::percent_decode_str(s)
-        .decode_utf8()
-        .map(|s| s.into_owned())
-        .map_err(|e| Error::InvalidUsage(format!("Invalid UTF-8 in URL: {}", e)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,14 +426,14 @@ mod tests {
     fn decodes_encoded_credentials_and_database() {
         let opts = Opts::try_from("postgres://al%40ice:p%40ss%2Fw%3Frd@localhost/my%20db").unwrap();
         assert_eq!(opts.user.as_c_str(), c"al@ice");
-        assert_eq!(opts.password.as_deref(), Some("p@ss/w?rd"));
+        assert_eq!(opts.password.as_deref(), Some(c"p@ss/w?rd"));
         assert_eq!(opts.database.as_deref(), Some(c"my db"));
     }
 
     #[test]
     fn decodes_raw_at_sign_in_password() {
         let opts = Opts::try_from("postgres://alice:p@ss@localhost/db").unwrap();
-        assert_eq!(opts.password.as_deref(), Some("p@ss"));
+        assert_eq!(opts.password.as_deref(), Some(c"p@ss"));
         assert_eq!(opts.host, "localhost");
     }
 
@@ -445,7 +441,7 @@ mod tests {
     fn keeps_plain_values() {
         let opts = Opts::try_from("postgres://alice:secret@localhost/db").unwrap();
         assert_eq!(opts.user.as_c_str(), c"alice");
-        assert_eq!(opts.password.as_deref(), Some("secret"));
+        assert_eq!(opts.password.as_deref(), Some(c"secret"));
         assert_eq!(opts.database.as_deref(), Some(c"db"));
     }
 
@@ -460,7 +456,7 @@ mod tests {
         assert!(without_fn.contains("password_fn: None"), "{without_fn}");
 
         let opts = Opts {
-            password_fn: Some(Arc::new(|| Ok("secret".into()))),
+            password_fn: Some(Arc::new(|| Ok(c"secret".into()))),
             ..Opts::default()
         };
         let with_fn = format!("{opts:?}");
@@ -477,7 +473,7 @@ mod tests {
         );
 
         let opts = Opts {
-            password: Some("secret".into()),
+            password: Some(c"secret".into()),
             ..Opts::default()
         };
         let with_password = format!("{opts:?}");
@@ -631,6 +627,15 @@ mod tests {
         let err = Opts::try_from("postgres://al%00ice@localhost/db").unwrap_err();
         assert!(
             matches!(&err, Error::InvalidUsage(message) if message == "NUL byte in URL user"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_nul_byte_in_url_password() {
+        let err = Opts::try_from("postgres://alice:se%00cret@localhost/db").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidUsage(message) if message == "NUL byte in URL password"),
             "{err}"
         );
     }

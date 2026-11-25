@@ -11,12 +11,13 @@ use crate::protocol::backend::{
     AuthenticationMessage, BackendKeyData, ErrorResponse, NegotiateProtocolVersion,
     ParameterStatus, RawMessage, ReadyForQuery, msg_type,
 };
-use crate::protocol::frontend::auth::{ScramClient, md5_password};
+use crate::protocol::frontend::auth::ScramClient;
 #[cfg(feature = "auth-gss")]
 use crate::protocol::frontend::write_gss_response;
 use crate::protocol::frontend::{
     startup::{PROTOCOL_VERSION_3_0, PROTOCOL_VERSION_3_2, write_ssl_request},
-    write_password, write_sasl_initial_response, write_sasl_response, write_startup,
+    write_md5_password, write_password, write_sasl_initial_response, write_sasl_response,
+    write_startup,
 };
 use crate::protocol::types::TransactionStatus;
 
@@ -197,7 +198,7 @@ impl<'a> ConnectionStateMachine<'a> {
         Ok(())
     }
 
-    fn required_password(&self) -> Result<Cow<'_, str>> {
+    fn required_password(&self) -> Result<Cow<'_, CStr>> {
         self.options
             .get_password()?
             .ok_or_else(|| Error::Auth("Password required but not provided".into()))
@@ -287,9 +288,13 @@ impl<'a> ConnectionStateMachine<'a> {
             AuthenticationMessage::Md5Password { salt } => {
                 let password = self.required_password()?;
 
-                let hashed = md5_password(self.options.user.to_bytes(), &password, &salt);
                 buffer_set.write_buffer.clear();
-                write_password(&mut buffer_set.write_buffer, &hashed);
+                write_md5_password(
+                    &mut buffer_set.write_buffer,
+                    self.options.user.to_bytes(),
+                    &password,
+                    &salt,
+                );
                 self.state = State::WaitingAuthResult;
                 Ok(Action::WriteAndReadMessage)
             }
@@ -706,6 +711,8 @@ impl StateMachine for ConnectionStateMachine<'_> {
 mod tests {
     use super::*;
     use crate::opts::TlsMode;
+    use crate::protocol::frontend::auth::md5_password;
+    use std::ffi::CString;
     use std::sync::Arc;
 
     fn negotiate_message(newest_version: i32, options: &[&str]) -> Vec<u8> {
@@ -1183,7 +1190,7 @@ mod tests {
             &["PLAIN"],
         ] {
             let options = Opts {
-                password: Some("secret".into()),
+                password: Some(c"secret".into()),
                 ..Opts::default()
             };
             let mut machine = auth_machine(&options);
@@ -1206,7 +1213,7 @@ mod tests {
     #[test]
     fn password_fn_used_for_cleartext() {
         let options = Opts {
-            password_fn: Some(Arc::new(|| Ok("from-fn".into()))),
+            password_fn: Some(Arc::new(|| Ok(c"from-fn".into()))),
             ..Opts::default()
         };
         let mut machine = auth_machine(&options);
@@ -1235,8 +1242,8 @@ mod tests {
     fn password_fn_takes_precedence_over_password() {
         let options = Opts {
             user: c"alice".into(),
-            password: Some("static".into()),
-            password_fn: Some(Arc::new(|| Ok("dynamic".into()))),
+            password: Some(c"static".into()),
+            password_fn: Some(Arc::new(|| Ok(c"dynamic".into()))),
             ..Opts::default()
         };
 
@@ -1264,7 +1271,7 @@ mod tests {
             &auth_payload(5, &salt),
         )
         .unwrap();
-        let mut expected = md5_password(b"alice", "dynamic", &salt).into_bytes();
+        let mut expected = md5_password(b"alice", c"dynamic", &salt).into_bytes();
         expected.push(0);
         assert_eq!(md5_buffer_set.write_buffer, password_message(&expected));
     }
@@ -1276,7 +1283,7 @@ mod tests {
         let options = Opts {
             password_fn: Some(Arc::new(move || {
                 let call = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(format!("pw{call}"))
+                Ok(CString::new(format!("pw{call}")).unwrap())
             })),
             ..Opts::default()
         };
@@ -1310,7 +1317,7 @@ mod tests {
     #[test]
     fn password_fn_error_propagates() {
         let options = Opts {
-            password: Some("static".into()),
+            password: Some(c"static".into()),
             password_fn: Some(Arc::new(|| Err(Error::Auth("vault unavailable".into())))),
             ..Opts::default()
         };
@@ -1341,7 +1348,7 @@ mod tests {
     #[test]
     fn password_fn_may_return_empty_password() {
         let options = Opts {
-            password_fn: Some(Arc::new(|| Ok(String::new()))),
+            password_fn: Some(Arc::new(|| Ok(CString::default()))),
             ..Opts::default()
         };
         let mut machine = auth_machine(&options);
@@ -1359,7 +1366,7 @@ mod tests {
     #[test]
     fn password_used_without_password_fn() {
         let options = Opts {
-            password: Some("static".into()),
+            password: Some(c"static".into()),
             ..Opts::default()
         };
         let mut machine = auth_machine(&options);
@@ -1666,7 +1673,7 @@ mod tests {
     #[test]
     fn oauth_bearer_token_fn_error_propagates() {
         let options = Opts {
-            password: Some("static".into()),
+            password: Some(c"static".into()),
             oauth_bearer_token_fn: Some(Arc::new(|| Err(Error::Auth("issuer unreachable".into())))),
             ..Opts::default()
         };
@@ -1787,7 +1794,7 @@ mod tests {
         for options in [
             Opts::default(),
             Opts {
-                password: Some("secret".into()),
+                password: Some(c"secret".into()),
                 ..Opts::default()
             },
         ] {
@@ -1813,7 +1820,7 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
         let options = Opts {
-            password: Some("secret".into()),
+            password: Some(c"secret".into()),
             oauth_bearer_token_fn: Some(Arc::new(move || {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok("tok".into())
@@ -1841,7 +1848,7 @@ mod tests {
 
     fn secret_password_opts() -> Opts {
         Opts {
-            password: Some("secret".into()),
+            password: Some(c"secret".into()),
             ..Opts::default()
         }
     }
@@ -1955,7 +1962,7 @@ mod tests {
         use crate::tls::tests::ED25519_CERTIFICATE;
 
         let options = Opts {
-            password: Some("secret".into()),
+            password: Some(c"secret".into()),
             ..Opts::default()
         };
         let mut machine = auth_machine(&options);
@@ -2029,7 +2036,7 @@ mod tests {
 
     fn tls_mode_opts(tls_mode: TlsMode) -> Opts {
         Opts {
-            password: Some("secret".into()),
+            password: Some(c"secret".into()),
             oauth_bearer_token_fn: Some(Arc::new(|| Ok("token".into()))),
             tls_mode,
             ..Opts::default()
