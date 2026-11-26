@@ -176,6 +176,12 @@ impl Stream {
             .split_first_chunk::<4>()
             .ok_or_else(|| std::io::Error::other("protocol: header shorter than 5 bytes"))?;
         let length = u32::from_be_bytes(*len_bytes) as usize;
+        if length < 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message length {length} is shorter than its own 4-byte length field"),
+            ));
+        }
         if let Some(max_length) = max_length
             && length > max_length
         {
@@ -186,7 +192,7 @@ impl Stream {
         }
         self.read_pos += 5;
 
-        let payload_len = length.saturating_sub(4);
+        let payload_len = length - 4;
         if payload_len == 0 {
             buffer_set.read_buffer.clear();
             return Ok(());

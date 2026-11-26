@@ -101,6 +101,12 @@ impl Stream {
         let mut length_bytes = [0u8; 4];
         self.read_exact(&mut length_bytes)?;
         let length = u32::from_be_bytes(length_bytes) as usize;
+        if length < 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message length {length} is shorter than its own 4-byte length field"),
+            ));
+        }
         if let Some(max_length) = max_length
             && length > max_length
         {
@@ -110,7 +116,7 @@ impl Stream {
             ));
         }
 
-        let payload_len = length.saturating_sub(4);
+        let payload_len = length - 4;
         buffer_set.read_buffer.clear();
         buffer_set.read_buffer.resize(payload_len, 0);
         self.read_exact(&mut buffer_set.read_buffer)?;

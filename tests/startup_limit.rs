@@ -84,30 +84,58 @@ fn read_startup(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(packet)
 }
 
-fn length_cases() -> Result<[(u32, ErrorKind); 3], Box<dyn std::error::Error>> {
+enum Expected {
+    InvalidData(String),
+    UnexpectedEof,
+    NotInvalidData,
+}
+
+fn length_cases() -> Result<[(u32, Expected); 6], Box<dyn std::error::Error>> {
     let limit = u32::try_from(MAX_STARTUP_MESSAGE_LENGTH)?;
+    let exceeds = |length: u32| {
+        Expected::InvalidData(format!(
+            "message length {length} exceeds the limit of {MAX_STARTUP_MESSAGE_LENGTH}"
+        ))
+    };
+    let shorter = |length: u32| {
+        Expected::InvalidData(format!(
+            "message length {length} is shorter than its own 4-byte length field"
+        ))
+    };
     Ok([
-        (limit + 1, ErrorKind::InvalidData),
-        (u32::MAX, ErrorKind::InvalidData),
-        (limit, ErrorKind::UnexpectedEof),
+        (limit + 1, exceeds(limit + 1)),
+        (u32::MAX, exceeds(u32::MAX)),
+        (limit, Expected::UnexpectedEof),
+        (0, shorter(0)),
+        (3, shorter(3)),
+        (4, Expected::NotInvalidData),
     ])
 }
 
 // ─── Assertions ───────────────────────────────────────────────────────────────
 
-fn assert_io_error<T>(result: Result<T, Error>, elapsed: Duration, length: u32, kind: ErrorKind) {
+fn assert_error<T>(result: Result<T, Error>, elapsed: Duration, length: u32, expected: Expected) {
     let error = result.err();
-    assert!(
-        matches!(&error, Some(Error::Io(io_error)) if io_error.kind() == kind),
-        "length {length}: expected Error::Io({kind:?}), got {error:?}"
-    );
-    if kind == ErrorKind::InvalidData {
-        assert_eq!(
-            error.map(|error| error.to_string()),
-            Some(format!(
-                "I/O error: message length {length} exceeds the limit of {MAX_STARTUP_MESSAGE_LENGTH}"
-            ))
-        );
+    match expected {
+        Expected::InvalidData(message) => {
+            assert!(
+                matches!(&error, Some(Error::Io(io_error)) if io_error.kind() == ErrorKind::InvalidData),
+                "length {length}: expected Error::Io(InvalidData), got {error:?}"
+            );
+            assert_eq!(
+                error.map(|error| error.to_string()),
+                Some(format!("I/O error: {message}"))
+            );
+        }
+        Expected::UnexpectedEof => assert!(
+            matches!(&error, Some(Error::Io(io_error)) if io_error.kind() == ErrorKind::UnexpectedEof),
+            "length {length}: expected Error::Io(UnexpectedEof), got {error:?}"
+        ),
+        Expected::NotInvalidData => assert!(
+            error.is_some()
+                && !matches!(&error, Some(Error::Io(io_error)) if io_error.kind() == ErrorKind::InvalidData),
+            "length {length}: expected an error other than Error::Io(InvalidData), got {error:?}"
+        ),
     }
     assert!(
         elapsed < UPPER_BOUND,
@@ -118,40 +146,40 @@ fn assert_io_error<T>(result: Result<T, Error>, elapsed: Duration, length: u32, 
 // ─── Startup Message Length ───────────────────────────────────────────────────
 
 #[test]
-fn sync_startup_message_length_limit() -> TestResult {
-    for (length, kind) in length_cases()? {
+fn sync_startup_message_length() -> TestResult {
+    for (length, expected) in length_cases()? {
         let server = FakeServer::header_only(length)?;
         let started = Instant::now();
         let result = zero_postgres::sync::Conn::new(server.opts());
-        assert_io_error(result, started.elapsed(), length, kind);
+        assert_error(result, started.elapsed(), length, expected);
         server.join()?;
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn tokio_startup_message_length_limit() -> TestResult {
-    for (length, kind) in length_cases()? {
+async fn tokio_startup_message_length() -> TestResult {
+    for (length, expected) in length_cases()? {
         let server = FakeServer::header_only(length)?;
         let mut opts = server.opts();
         opts.client_timeout.connect = Some(UPPER_BOUND);
         let started = Instant::now();
         let result = zero_postgres::tokio::Conn::new(opts).await;
-        assert_io_error(result, started.elapsed(), length, kind);
+        assert_error(result, started.elapsed(), length, expected);
         server.join()?;
     }
     Ok(())
 }
 
 #[compio::test]
-async fn compio_startup_message_length_limit() -> TestResult {
-    for (length, kind) in length_cases()? {
+async fn compio_startup_message_length() -> TestResult {
+    for (length, expected) in length_cases()? {
         let server = FakeServer::header_only(length)?;
         let mut opts = server.opts();
         opts.client_timeout.connect = Some(UPPER_BOUND);
         let started = Instant::now();
         let result = zero_postgres::compio::Conn::new(opts).await;
-        assert_io_error(result, started.elapsed(), length, kind);
+        assert_error(result, started.elapsed(), length, expected);
         server.join_on_compio().await?;
     }
     Ok(())
