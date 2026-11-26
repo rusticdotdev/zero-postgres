@@ -331,7 +331,13 @@ impl<'a> ConnectionStateMachine<'a> {
                 if mechanisms.contains(&"OAUTHBEARER") {
                     let initial_response = match &self.options.oauth_bearer_token_fn {
                         Some(oauth_bearer_token_fn) => {
-                            format!("n,,\x01auth=Bearer {}\x01\x01", oauth_bearer_token_fn()?)
+                            let token = oauth_bearer_token_fn()?;
+                            if memchr::memchr(0x01, token.as_bytes()).is_some() {
+                                return Err(Error::InvalidUsage(
+                                    "0x01 byte in OAuth bearer token".into(),
+                                ));
+                            }
+                            format!("n,,\x01auth=Bearer {token}\x01\x01")
                         }
                         None if self.options.oauth_discovery_fn.is_some() => {
                             "n,,\x01auth=\x01\x01".to_string()
@@ -1836,6 +1842,28 @@ mod tests {
         assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
         assert_eq!(buffer_set.write_buffer, oauth_initial_response_message(""));
         assert_eq!(machine.state, State::OauthInProgress);
+    }
+
+    #[test]
+    fn oauth_bearer_token_with_separator_byte_rejected() {
+        let options = Opts {
+            oauth_bearer_token_fn: Some(Arc::new(|| Ok("abc\x01host=evil".into()))),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(&options);
+        let mut buffer_set = BufferSet::new();
+        let err = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &sasl_payload(&["OAUTHBEARER"]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidUsage(message) if message == "0x01 byte in OAuth bearer token"),
+            "{err}"
+        );
+        assert!(buffer_set.write_buffer.is_empty());
     }
 
     #[test]
