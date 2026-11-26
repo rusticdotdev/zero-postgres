@@ -1,7 +1,6 @@
 //! Startup and termination messages.
 
-use std::ffi::CStr;
-
+use crate::error::{Error, Result};
 use crate::protocol::codec::MessageBuilder;
 
 /// Protocol version 3.0 (0x00030000)
@@ -33,28 +32,36 @@ pub fn write_ssl_request(buf: &mut Vec<u8>) {
 /// Optional: "database", "options", "replication", "client_encoding", etc.
 pub fn write_startup<'a>(
     buf: &mut Vec<u8>,
-    params: impl IntoIterator<Item = (&'a CStr, &'a CStr)>,
-) {
-    write_startup_with_version(buf, PROTOCOL_VERSION_3_2, params);
+    params: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    write_startup_with_version(buf, PROTOCOL_VERSION_3_2, params)
 }
 
 /// Write a StartupMessage with a specific protocol version.
 pub fn write_startup_with_version<'a>(
     buf: &mut Vec<u8>,
     version: i32,
-    params: impl IntoIterator<Item = (&'a CStr, &'a CStr)>,
-) {
+    params: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let start = buf.len();
     let mut msg = MessageBuilder::new_startup(buf);
     msg.write_i32(version);
 
     for (name, value) in params {
-        msg.write_bytes(name.to_bytes_with_nul());
-        msg.write_bytes(value.to_bytes_with_nul());
+        if memchr::memchr(0, value.as_bytes()).is_some() {
+            msg.buf().truncate(start);
+            return Err(Error::InvalidUsage(format!(
+                "NUL byte in the value of startup parameter {name:?}"
+            )));
+        }
+        msg.write_cstr(name);
+        msg.write_cstr(value);
     }
 
     // Terminator
     msg.write_u8(0);
     msg.finish();
+    Ok(())
 }
 
 /// Write a CancelRequest message.
@@ -96,7 +103,7 @@ mod tests {
     #[test]
     fn startup() {
         let mut buf = Vec::new();
-        write_startup(&mut buf, [(c"user", c"postgres"), (c"database", c"test")]);
+        write_startup(&mut buf, [("user", "postgres"), ("database", "test")]).unwrap();
 
         // Check length is at start
         let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -110,14 +117,14 @@ mod tests {
     #[test]
     fn startup_bytes() {
         let mut one_param = Vec::new();
-        write_startup(&mut one_param, [(c"user", c"alice")]);
+        write_startup(&mut one_param, [("user", "alice")]).unwrap();
         let mut one_param_expected = 20_i32.to_be_bytes().to_vec();
         one_param_expected.extend_from_slice(&[0, 3, 0, 2]);
         one_param_expected.extend_from_slice(b"user\0alice\0\0");
         assert_eq!(one_param, one_param_expected);
 
         let mut two_params = Vec::new();
-        write_startup(&mut two_params, [(c"user", c"alice"), (c"database", c"")]);
+        write_startup(&mut two_params, [("user", "alice"), ("database", "")]).unwrap();
         let mut two_params_expected = 30_i32.to_be_bytes().to_vec();
         two_params_expected.extend_from_slice(&[0, 3, 0, 2]);
         two_params_expected.extend_from_slice(b"user\0alice\0database\0\0\0");

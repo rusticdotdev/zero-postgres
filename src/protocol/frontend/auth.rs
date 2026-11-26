@@ -1,20 +1,20 @@
 //! Authentication messages.
 
-use std::ffi::{CStr, CString};
-
 use crate::protocol::codec::MessageBuilder;
 
 const MIN_SCRAM_ITERATIONS: u32 = 4096;
 const MAX_SCRAM_ITERATIONS: u32 = 10_000_000;
 
 /// Write a PasswordMessage (cleartext or MD5 hashed password).
-pub fn write_password(buf: &mut Vec<u8>, password: &CStr) {
+pub fn write_password(buf: &mut Vec<u8>, password: &str) -> crate::error::Result<()> {
+    super::reject_nul_byte(password, "password")?;
     let mut msg = MessageBuilder::new(buf, super::msg_type::PASSWORD);
-    msg.write_bytes(password.to_bytes_with_nul());
+    msg.write_cstr(password);
     msg.finish();
+    Ok(())
 }
 
-pub fn write_md5_password(buf: &mut Vec<u8>, username: &[u8], password: &CStr, salt: &[u8; 4]) {
+pub fn write_md5_password(buf: &mut Vec<u8>, username: &[u8], password: &str, salt: &[u8; 4]) {
     let hashed = md5_password(username, password, salt);
     let mut msg = MessageBuilder::new(buf, super::msg_type::PASSWORD);
     msg.write_cstr(&hashed);
@@ -35,13 +35,13 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 /// Compute MD5 password hash.
 ///
 /// PostgreSQL MD5 password format: "md5" + md5(md5(password + username) + salt)
-pub fn md5_password(username: &[u8], password: &CStr, salt: &[u8; 4]) -> String {
+pub fn md5_password(username: &[u8], password: &str, salt: &[u8; 4]) -> String {
     use md5::{Digest, Md5};
 
     // First hash: md5(password + username)
     let first_hash = {
         let mut hasher = Md5::new();
-        hasher.update(password.to_bytes());
+        hasher.update(password.as_bytes());
         hasher.update(username);
         hasher.finalize()
     };
@@ -92,7 +92,7 @@ pub struct ScramClient {
     gs2_header: &'static str,
     channel_binding_data: Vec<u8>,
     /// Password
-    password: CString,
+    password: String,
     /// Auth message for signature verification
     auth_message: Option<String>,
     /// Salted password for server signature verification
@@ -101,21 +101,21 @@ pub struct ScramClient {
 
 impl ScramClient {
     /// Create a new SCRAM client.
-    pub fn new(password: &CStr) -> Self {
+    pub fn new(password: &str) -> Self {
         Self::with_gs2_header(password, "n,,", &[])
     }
 
     /// Create a new SCRAM client with channel binding.
-    pub fn new_with_channel_binding(password: &CStr, channel_binding_data: &[u8]) -> Self {
+    pub fn new_with_channel_binding(password: &str, channel_binding_data: &[u8]) -> Self {
         Self::with_gs2_header(password, "p=tls-server-end-point,,", channel_binding_data)
     }
 
-    pub fn new_with_unadvertised_channel_binding(password: &CStr) -> Self {
+    pub fn new_with_unadvertised_channel_binding(password: &str) -> Self {
         Self::with_gs2_header(password, "y,,", &[])
     }
 
     fn with_gs2_header(
-        password: &CStr,
+        password: &str,
         gs2_header: &'static str,
         channel_binding_data: &[u8],
     ) -> Self {
@@ -204,7 +204,7 @@ impl ScramClient {
         // Compute SaltedPassword = Hi(Normalize(password), salt, iterations)
         let mut salted_password = vec![0u8; 32];
         pbkdf2_hmac::<Sha256>(
-            self.password.to_bytes(),
+            self.password.as_bytes(),
             &salt,
             iterations,
             &mut salted_password,
@@ -338,14 +338,14 @@ mod tests {
     #[test]
     fn md5_password_hash() {
         // Test vector from PostgreSQL
-        let result = md5_password(b"postgres", c"password", &[0x01, 0x02, 0x03, 0x04]);
+        let result = md5_password(b"postgres", "password", &[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(result, "md598511ceaec347a656f032c7f2a16ef17");
     }
 
     #[test]
     fn password_message() {
         let mut buf = Vec::new();
-        write_password(&mut buf, c"secret");
+        write_password(&mut buf, "secret").unwrap();
 
         assert_eq!(buf[0], b'p');
         // Check that password is null-terminated in the message
@@ -355,12 +355,7 @@ mod tests {
     #[test]
     fn md5_password_message() {
         let mut buf = Vec::new();
-        write_md5_password(
-            &mut buf,
-            b"postgres",
-            c"password",
-            &[0x01, 0x02, 0x03, 0x04],
-        );
+        write_md5_password(&mut buf, b"postgres", "password", &[0x01, 0x02, 0x03, 0x04]);
 
         let mut expected = vec![b'p'];
         expected.extend_from_slice(&40_i32.to_be_bytes());
@@ -397,13 +392,13 @@ mod tests {
     fn client_first_message_starts_with_gs2_header() {
         let channel_binding_data: Vec<u8> = (0..=255).collect();
         for (scram, header) in [
-            (ScramClient::new(c"secret"), "n,,"),
+            (ScramClient::new("secret"), "n,,"),
             (
-                ScramClient::new_with_unadvertised_channel_binding(c"secret"),
+                ScramClient::new_with_unadvertised_channel_binding("secret"),
                 "y,,",
             ),
             (
-                ScramClient::new_with_channel_binding(c"secret", &channel_binding_data),
+                ScramClient::new_with_channel_binding("secret", &channel_binding_data),
                 "p=tls-server-end-point,,",
             ),
         ] {
@@ -422,12 +417,12 @@ mod tests {
     #[test]
     fn client_final_channel_binding_without_binding_data() {
         assert_eq!(
-            channel_binding_attribute(&mut ScramClient::new(c"secret")),
+            channel_binding_attribute(&mut ScramClient::new("secret")),
             "biws"
         );
         assert_eq!(
             channel_binding_attribute(&mut ScramClient::new_with_unadvertised_channel_binding(
-                c"secret"
+                "secret"
             )),
             "eSws"
         );
@@ -440,7 +435,7 @@ mod tests {
             vec![0x00, 0xff, 0xfe, 0x80, 0x00],
             (0..=255).collect::<Vec<u8>>(),
         ] {
-            let mut scram = ScramClient::new_with_channel_binding(c"secret", &channel_binding_data);
+            let mut scram = ScramClient::new_with_channel_binding("secret", &channel_binding_data);
             let expected = encode(
                 &[
                     b"p=tls-server-end-point,,".as_slice(),
@@ -455,7 +450,7 @@ mod tests {
     #[test]
     fn channel_binding_known_answer() {
         let channel_binding_data: Vec<u8> = (0..32).collect();
-        let mut scram = ScramClient::new_with_channel_binding(c"pencil", &channel_binding_data);
+        let mut scram = ScramClient::new_with_channel_binding("pencil", &channel_binding_data);
         scram.nonce = "rOprNGfwEbeRWgbNEkqO".to_string();
         assert_eq!(
             scram.client_first_message(),
@@ -485,7 +480,7 @@ mod tests {
         let server_first = "r=fixednonceserver,s=c2FsdA==,i=4096";
         let mut proofs = Vec::new();
         for channel_binding_data in [[0u8; 32], [1u8; 32]] {
-            let mut scram = ScramClient::new_with_channel_binding(c"secret", &channel_binding_data);
+            let mut scram = ScramClient::new_with_channel_binding("secret", &channel_binding_data);
             scram.nonce = "fixednonce".to_string();
             let client_final = scram.process_server_first(server_first).unwrap();
             proofs.push(client_final.rsplit_once(",p=").unwrap().1.to_string());
@@ -495,7 +490,7 @@ mod tests {
 
     #[test]
     fn scram_requires_server_nonce_extending_client_nonce() {
-        let mut scram = ScramClient::new(c"secret");
+        let mut scram = ScramClient::new("secret");
         let client_nonce = scram
             .client_first_message()
             .strip_prefix("n,,n=,r=")
@@ -539,7 +534,7 @@ mod tests {
     #[test]
     fn scram_rejects_iterations_above_maximum() {
         for iterations in [MAX_SCRAM_ITERATIONS + 1, u32::MAX] {
-            let mut scram = ScramClient::new(c"secret");
+            let mut scram = ScramClient::new("secret");
             let server_first = format!(
                 "r={}server,s={},i={iterations}",
                 scram.nonce,
@@ -563,7 +558,7 @@ mod tests {
     #[test]
     fn scram_rejects_iterations_below_minimum() {
         for iterations in [1, MIN_SCRAM_ITERATIONS - 1] {
-            let mut scram = ScramClient::new(c"secret");
+            let mut scram = ScramClient::new("secret");
             let server_first = format!(
                 "r={}server,s={},i={iterations}",
                 scram.nonce,
@@ -592,7 +587,7 @@ mod tests {
             ("4096x", "Missing iterations in server-first-message"),
             ("99999999999", "Missing iterations in server-first-message"),
         ] {
-            let mut scram = ScramClient::new(c"secret");
+            let mut scram = ScramClient::new("secret");
             let server_first = format!(
                 "r={}server,s={},i={iterations}",
                 scram.nonce,
@@ -613,7 +608,7 @@ mod tests {
     #[test]
     fn scram_accepts_iterations_within_bounds() {
         for iterations in [MIN_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS + 1] {
-            let mut scram = ScramClient::new(c"secret");
+            let mut scram = ScramClient::new("secret");
             let server_first = format!(
                 "r={}server,s={},i={iterations}",
                 scram.nonce,

@@ -1,7 +1,6 @@
 //! Connection startup and authentication state machine.
 
 use std::borrow::Cow;
-use std::ffi::CStr;
 
 use crate::error::{Error, Result};
 #[cfg(feature = "auth-gss")]
@@ -15,6 +14,7 @@ use crate::protocol::frontend::auth::{ScramClient, ScramStep};
 #[cfg(feature = "auth-gss")]
 use crate::protocol::frontend::write_gss_response;
 use crate::protocol::frontend::{
+    reject_nul_byte,
     startup::{PROTOCOL_VERSION_3_0, PROTOCOL_VERSION_3_2, write_ssl_request},
     write_md5_password, write_password, write_sasl_initial_response, write_sasl_response,
     write_startup,
@@ -166,38 +166,42 @@ impl<'a> ConnectionStateMachine<'a> {
     }
 
     fn write_startup_message(&self, write_buffer: &mut Vec<u8>) -> Result<()> {
-        if self.options.params.iter().any(|(name, _)| name.is_empty()) {
-            return Err(Error::InvalidUsage(
-                "Empty parameter name in Opts::params".into(),
-            ));
+        for (name, _) in &self.options.params {
+            if name.is_empty() {
+                return Err(Error::InvalidUsage(
+                    "Empty parameter name in Opts::params".into(),
+                ));
+            }
+            reject_nul_byte(name, "a parameter name in Opts::params")?;
         }
 
-        let user: &CStr = &self.options.user;
-        let params = [(c"user", user), (c"client_encoding", c"UTF8")]
-            .into_iter()
-            .chain(
-                self.options
-                    .database
-                    .as_deref()
-                    .map(|database| (c"database", database)),
-            )
-            .chain(
-                self.options
-                    .application_name
-                    .as_deref()
-                    .map(|application_name| (c"application_name", application_name)),
-            )
-            .chain(
-                self.options
-                    .params
-                    .iter()
-                    .map(|(name, value)| (name.as_c_str(), value.as_c_str())),
-            );
-        write_startup(write_buffer, params);
-        Ok(())
+        let params = [
+            ("user", self.options.user.as_str()),
+            ("client_encoding", "UTF8"),
+        ]
+        .into_iter()
+        .chain(
+            self.options
+                .database
+                .as_deref()
+                .map(|database| ("database", database)),
+        )
+        .chain(
+            self.options
+                .application_name
+                .as_deref()
+                .map(|application_name| ("application_name", application_name)),
+        )
+        .chain(
+            self.options
+                .params
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+        write_startup(write_buffer, params)
     }
 
-    fn required_password(&self) -> Result<Cow<'_, CStr>> {
+    fn required_password(&self) -> Result<Cow<'_, str>> {
         self.options
             .get_password()?
             .ok_or_else(|| Error::Auth("Password required but not provided".into()))
@@ -229,7 +233,7 @@ impl<'a> ConnectionStateMachine<'a> {
                 .options
                 .params
                 .iter()
-                .filter(|(name, _)| name.to_bytes().starts_with(b"_pq_."))
+                .filter(|(name, _)| name.starts_with("_pq_."))
                 .count();
             let negotiate =
                 NegotiateProtocolVersion::parse(&buffer_set.read_buffer, sent_option_count)?;
@@ -280,7 +284,7 @@ impl<'a> ConnectionStateMachine<'a> {
                 let password = self.required_password()?;
 
                 buffer_set.write_buffer.clear();
-                write_password(&mut buffer_set.write_buffer, &password);
+                write_password(&mut buffer_set.write_buffer, &password)?;
                 self.state = State::WaitingAuthResult;
                 Ok(Action::WriteAndReadMessage)
             }
@@ -290,7 +294,7 @@ impl<'a> ConnectionStateMachine<'a> {
                 buffer_set.write_buffer.clear();
                 write_md5_password(
                     &mut buffer_set.write_buffer,
-                    self.options.user.to_bytes(),
+                    self.options.user.as_bytes(),
                     &password,
                     &salt,
                 );
@@ -747,7 +751,6 @@ mod tests {
     use super::*;
     use crate::opts::TlsMode;
     use crate::protocol::frontend::auth::md5_password;
-    use std::ffi::CString;
     use std::sync::Arc;
 
     fn negotiate_message(newest_version: i32, options: &[&str]) -> Vec<u8> {
@@ -760,7 +763,7 @@ mod tests {
         payload
     }
 
-    fn opts_with_params(params: &[(&CStr, &CStr)]) -> Opts {
+    fn opts_with_params(params: &[(&str, &str)]) -> Opts {
         Opts {
             params: params
                 .iter()
@@ -804,9 +807,9 @@ mod tests {
     #[test]
     fn negotiate_rejects_unrecognized_options() {
         for sent in [
-            &[(c"_pq_.unknown", c"on")][..],
-            &[(c"search_path", c"public"), (c"_pq_.unknown", c"on")],
-            &[(c"_pq_.other", c"1"), (c"_pq_.unknown", c"on")],
+            &[("_pq_.unknown", "on")][..],
+            &[("search_path", "public"), ("_pq_.unknown", "on")],
+            &[("_pq_.other", "1"), ("_pq_.unknown", "on")],
         ] {
             let options = opts_with_params(sent);
             let mut machine = auth_machine(&options);
@@ -829,16 +832,16 @@ mod tests {
     fn negotiate_rejects_option_count_above_sent_options() {
         for (sent, options) in [
             (&[][..], &["_pq_.unknown"][..]),
-            (&[(c"search_path", c"public")], &["_pq_.unknown"]),
+            (&[("search_path", "public")], &["_pq_.unknown"]),
             (
                 &[
-                    (c"search_path", c"public"),
-                    (c"pq_.almost", c"1"),
-                    (c"x_pq_.y", c"1"),
+                    ("search_path", "public"),
+                    ("pq_.almost", "1"),
+                    ("x_pq_.y", "1"),
                 ],
                 &["_pq_.unknown"],
             ),
-            (&[(c"_pq_.a", c"1")], &["_pq_.a", "_pq_.b"]),
+            (&[("_pq_.a", "1")], &["_pq_.a", "_pq_.b"]),
         ] {
             let opts = opts_with_params(sent);
             let mut machine = auth_machine(&opts);
@@ -861,7 +864,7 @@ mod tests {
     fn negotiate_rejects_u32_max_option_count() {
         let mut payload = PROTOCOL_VERSION_3_0.to_be_bytes().to_vec();
         payload.extend_from_slice(&u32::MAX.to_be_bytes());
-        let options = opts_with_params(&[(c"_pq_.a", c"1"), (c"_pq_.b", c"2")]);
+        let options = opts_with_params(&[("_pq_.a", "1"), ("_pq_.b", "2")]);
         let mut machine = auth_machine(&options);
         let mut buffer_set = BufferSet::new();
         let err = feed(
@@ -880,7 +883,7 @@ mod tests {
     #[test]
     fn negotiate_without_rejected_options_continues_to_authentication() {
         for version in [PROTOCOL_VERSION_3_0, PROTOCOL_VERSION_3_2] {
-            let options = opts_with_params(&[(c"search_path", c"public"), (c"_pq_.a", c"1")]);
+            let options = opts_with_params(&[("search_path", "public"), ("_pq_.a", "1")]);
             let mut machine = auth_machine(&options);
             let mut buffer_set = BufferSet::new();
             assert!(matches!(
@@ -932,7 +935,7 @@ mod tests {
     fn initial_step_without_tls_support_allows_only_insecure() {
         for tls_mode in TlsMode::ALL {
             let options = Opts {
-                user: c"alice".into(),
+                user: "alice".into(),
                 tls_mode,
                 ..Opts::default()
             };
@@ -975,10 +978,10 @@ mod tests {
     #[test]
     fn initial_step_writes_startup_message_bytes() {
         let options = Opts {
-            user: c"alice".into(),
-            database: Some(c"shop".into()),
-            application_name: Some(c"app".into()),
-            params: vec![(c"search_path".into(), c"public".into())],
+            user: "alice".into(),
+            database: Some("shop".into()),
+            application_name: Some("app".into()),
+            params: vec![("search_path".into(), "public".into())],
             tls_mode: TlsMode::Insecure,
             ..Opts::default()
         };
@@ -991,7 +994,7 @@ mod tests {
 
     fn ssl_response_opts(tls_mode: TlsMode) -> Opts {
         Opts {
-            user: c"alice".into(),
+            user: "alice".into(),
             tls_mode,
             ..Opts::default()
         }
@@ -1014,14 +1017,14 @@ mod tests {
     #[test]
     fn initial_step_rejects_empty_parameter_name() {
         for params in [
-            vec![(c"".into(), c"x".into())],
+            vec![("".into(), "x".into())],
             vec![
-                (c"search_path".into(), c"public".into()),
-                (c"".into(), c"".into()),
+                ("search_path".into(), "public".into()),
+                ("".into(), "".into()),
             ],
         ] {
             let options = Opts {
-                user: c"alice".into(),
+                user: "alice".into(),
                 params,
                 tls_mode: TlsMode::Insecure,
                 ..Opts::default()
@@ -1037,10 +1040,74 @@ mod tests {
     }
 
     #[test]
+    fn initial_step_rejects_nul_byte() {
+        let base = Opts {
+            user: "alice".into(),
+            database: Some("shop".into()),
+            application_name: Some("app".into()),
+            params: vec![("search_path".into(), "public".into())],
+            tls_mode: TlsMode::Insecure,
+            ..Opts::default()
+        };
+        for (options, expected) in [
+            (
+                Opts {
+                    user: "al\0ice".into(),
+                    ..base.clone()
+                },
+                r#"NUL byte in the value of startup parameter "user""#,
+            ),
+            (
+                Opts {
+                    database: Some("sh\0op".into()),
+                    ..base.clone()
+                },
+                r#"NUL byte in the value of startup parameter "database""#,
+            ),
+            (
+                Opts {
+                    application_name: Some("\0".into()),
+                    ..base.clone()
+                },
+                r#"NUL byte in the value of startup parameter "application_name""#,
+            ),
+            (
+                Opts {
+                    params: vec![
+                        ("search_path".into(), "public".into()),
+                        ("search\0path".into(), "x".into()),
+                    ],
+                    ..base.clone()
+                },
+                "NUL byte in a parameter name in Opts::params",
+            ),
+            (
+                Opts {
+                    params: vec![("search_path".into(), "pub\0lic".into())],
+                    ..base.clone()
+                },
+                r#"NUL byte in the value of startup parameter "search_path""#,
+            ),
+        ] {
+            let mut machine = ConnectionStateMachine::new(&options, false);
+            let mut buffer_set = BufferSet::new();
+            buffer_set.write_buffer.extend_from_slice(b"stale");
+            let err = machine.step(&mut buffer_set).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidUsage(message) if message == expected),
+                "{expected}: {err}"
+            );
+            assert!(buffer_set.write_buffer.is_empty(), "{expected}");
+            assert_eq!(machine.state, State::Initial, "{expected}");
+        }
+        assert!(!initial_startup_message(&base).is_empty());
+    }
+
+    #[test]
     fn initial_step_accepts_empty_parameter_value() {
         let options = Opts {
-            user: c"alice".into(),
-            params: vec![(c"search_path".into(), c"".into())],
+            user: "alice".into(),
+            params: vec![("search_path".into(), "".into())],
             tls_mode: TlsMode::Insecure,
             ..Opts::default()
         };
@@ -1054,8 +1121,8 @@ mod tests {
     #[test]
     fn ssl_response_refused_rejects_empty_parameter_name() {
         let options = Opts {
-            user: c"alice".into(),
-            params: vec![(c"".into(), c"x".into())],
+            user: "alice".into(),
+            params: vec![("".into(), "x".into())],
             tls_mode: TlsMode::Insecure,
             ..Opts::default()
         };
@@ -1072,8 +1139,8 @@ mod tests {
     fn tls_handshake_complete_rejects_empty_parameter_name() {
         for tls_mode in TlsMode::ALL {
             let options = Opts {
-                user: c"alice".into(),
-                params: vec![(c"".into(), c"x".into())],
+                user: "alice".into(),
+                params: vec![("".into(), "x".into())],
                 tls_mode,
                 ..Opts::default()
             };
@@ -1093,8 +1160,8 @@ mod tests {
     #[test]
     fn ssl_response_refused_accepts_empty_parameter_value() {
         let options = Opts {
-            user: c"alice".into(),
-            params: vec![(c"search_path".into(), c"".into())],
+            user: "alice".into(),
+            params: vec![("search_path".into(), "".into())],
             tls_mode: TlsMode::Insecure,
             ..Opts::default()
         };
@@ -1245,7 +1312,7 @@ mod tests {
             &["PLAIN"],
         ] {
             let options = Opts {
-                password: Some(c"secret".into()),
+                password: Some("secret".into()),
                 ..Opts::default()
             };
             let mut machine = auth_machine(&options);
@@ -1268,7 +1335,7 @@ mod tests {
     #[test]
     fn password_fn_used_for_cleartext() {
         let options = Opts {
-            password_fn: Some(Arc::new(|| Ok(c"from-fn".into()))),
+            password_fn: Some(Arc::new(|| Ok("from-fn".into()))),
             ..Opts::default()
         };
         let mut machine = auth_machine(&options);
@@ -1294,11 +1361,35 @@ mod tests {
     }
 
     #[test]
+    fn cleartext_rejects_nul_byte_in_password() {
+        let options = Opts {
+            password: Some("sec\0ret".into()),
+            ..Opts::default()
+        };
+        let mut machine = auth_machine(&options);
+        let mut buffer_set = BufferSet::new();
+        buffer_set.write_buffer.extend_from_slice(b"stale");
+        let err = feed(
+            &mut machine,
+            &mut buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(3, &[]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidUsage(message) if message == "NUL byte in password"),
+            "{err}"
+        );
+        assert!(buffer_set.write_buffer.is_empty());
+        assert_eq!(machine.state, State::WaitingAuth);
+    }
+
+    #[test]
     fn password_fn_takes_precedence_over_password() {
         let options = Opts {
-            user: c"alice".into(),
-            password: Some(c"static".into()),
-            password_fn: Some(Arc::new(|| Ok(c"dynamic".into()))),
+            user: "alice".into(),
+            password: Some("static".into()),
+            password_fn: Some(Arc::new(|| Ok("dynamic".into()))),
             ..Opts::default()
         };
 
@@ -1326,7 +1417,7 @@ mod tests {
             &auth_payload(5, &salt),
         )
         .unwrap();
-        let mut expected = md5_password(b"alice", c"dynamic", &salt).into_bytes();
+        let mut expected = md5_password(b"alice", "dynamic", &salt).into_bytes();
         expected.push(0);
         assert_eq!(md5_buffer_set.write_buffer, password_message(&expected));
     }
@@ -1338,7 +1429,7 @@ mod tests {
         let options = Opts {
             password_fn: Some(Arc::new(move || {
                 let call = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(CString::new(format!("pw{call}")).unwrap())
+                Ok(format!("pw{call}"))
             })),
             ..Opts::default()
         };
@@ -1372,7 +1463,7 @@ mod tests {
     #[test]
     fn password_fn_error_propagates() {
         let options = Opts {
-            password: Some(c"static".into()),
+            password: Some("static".into()),
             password_fn: Some(Arc::new(|| Err(Error::Auth("vault unavailable".into())))),
             ..Opts::default()
         };
@@ -1403,7 +1494,7 @@ mod tests {
     #[test]
     fn password_fn_may_return_empty_password() {
         let options = Opts {
-            password_fn: Some(Arc::new(|| Ok(CString::default()))),
+            password_fn: Some(Arc::new(|| Ok(String::new()))),
             ..Opts::default()
         };
         let mut machine = auth_machine(&options);
@@ -1421,7 +1512,7 @@ mod tests {
     #[test]
     fn password_used_without_password_fn() {
         let options = Opts {
-            password: Some(c"static".into()),
+            password: Some("static".into()),
             ..Opts::default()
         };
         let mut machine = auth_machine(&options);
@@ -1728,7 +1819,7 @@ mod tests {
     #[test]
     fn oauth_bearer_token_fn_error_propagates() {
         let options = Opts {
-            password: Some(c"static".into()),
+            password: Some("static".into()),
             oauth_bearer_token_fn: Some(Arc::new(|| Err(Error::Auth("issuer unreachable".into())))),
             ..Opts::default()
         };
@@ -1871,7 +1962,7 @@ mod tests {
         for options in [
             Opts::default(),
             Opts {
-                password: Some(c"secret".into()),
+                password: Some("secret".into()),
                 ..Opts::default()
             },
         ] {
@@ -1897,7 +1988,7 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
         let options = Opts {
-            password: Some(c"secret".into()),
+            password: Some("secret".into()),
             oauth_bearer_token_fn: Some(Arc::new(move || {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok("tok".into())
@@ -1938,7 +2029,7 @@ mod tests {
 
     fn secret_password_opts() -> Opts {
         Opts {
-            password: Some(c"secret".into()),
+            password: Some("secret".into()),
             ..Opts::default()
         }
     }
@@ -2118,7 +2209,7 @@ mod tests {
         use crate::tls::tests::ED25519_CERTIFICATE;
 
         let options = Opts {
-            password: Some(c"secret".into()),
+            password: Some("secret".into()),
             ..Opts::default()
         };
         let mut machine = auth_machine(&options);
@@ -2187,7 +2278,7 @@ mod tests {
 
     fn tls_mode_opts(tls_mode: TlsMode) -> Opts {
         Opts {
-            password: Some(c"secret".into()),
+            password: Some("secret".into()),
             oauth_bearer_token_fn: Some(Arc::new(|| Ok("token".into()))),
             tls_mode,
             ..Opts::default()

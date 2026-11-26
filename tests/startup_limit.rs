@@ -42,7 +42,7 @@ impl FakeServer {
         Opts {
             host: "127.0.0.1".into(),
             port: self.port,
-            user: c"u".into(),
+            user: "u".into(),
             upgrade_to_unix_socket: false,
             ..Opts::default()
         }

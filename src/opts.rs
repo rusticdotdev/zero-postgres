@@ -1,7 +1,6 @@
 //! Connection options.
 
 use std::borrow::Cow;
-use std::ffi::{CStr, CString, NulError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,21 +87,21 @@ pub struct Opts {
     /// Username for authentication.
     ///
     /// Default: `""`
-    pub user: CString,
+    pub user: String,
 
     /// Database name to use.
     ///
     /// Default: `None`
-    pub database: Option<CString>,
+    pub database: Option<String>,
 
     /// Password for authentication.
     ///
     /// Default: `None`
     #[debug("{}", if password.is_some() { "Some(***)" } else { "None" })]
-    pub password: Option<CString>,
+    pub password: Option<String>,
 
     #[debug("{}", if password_fn.is_some() { "Some(..)" } else { "None" })]
-    pub password_fn: Option<Arc<dyn Fn() -> Result<CString, Error> + Send + Sync>>,
+    pub password_fn: Option<Arc<dyn Fn() -> Result<String, Error> + Send + Sync>>,
 
     #[debug("{}", if oauth_bearer_token_fn.is_some() { "Some(..)" } else { "None" })]
     pub oauth_bearer_token_fn:
@@ -114,7 +113,7 @@ pub struct Opts {
     /// Application name to report to the server.
     ///
     /// Default: `None`
-    pub application_name: Option<CString>,
+    pub application_name: Option<String>,
 
     /// Default: `TlsMode::Insecure`
     pub tls_mode: TlsMode,
@@ -156,7 +155,7 @@ pub struct Opts {
     /// Additional connection parameters.
     ///
     /// Default: `[]`
-    pub params: Vec<(CString, CString)>,
+    pub params: Vec<(String, String)>,
 
     /// When connected via TCP to loopback, upgrade to Unix socket for better performance.
     ///
@@ -182,7 +181,7 @@ pub struct Opts {
 }
 
 impl Opts {
-    pub(crate) fn get_password(&self) -> Result<Option<Cow<'_, CStr>>, Error> {
+    pub(crate) fn get_password(&self) -> Result<Option<Cow<'_, str>>, Error> {
         if let Some(password_fn) = &self.password_fn {
             return password_fn().map(|password| Some(Cow::Owned(password)));
         }
@@ -234,7 +233,7 @@ impl Default for Opts {
             host: String::new(),
             port: 5432,
             socket: None,
-            user: CString::default(),
+            user: String::new(),
             database: None,
             password: None,
             password_fn: None,
@@ -282,13 +281,10 @@ impl TryFrom<&Url> for Opts {
         let mut opts = Opts {
             host: url.host_str().unwrap_or("localhost").to_string(),
             port: url.port().unwrap_or(5432),
-            user: percent_decode_cstring(url.username(), "user")?,
-            password: url
-                .password()
-                .map(|password| percent_decode_cstring(password, "password"))
-                .transpose()?,
+            user: percent_decode(url.username())?,
+            password: url.password().map(percent_decode).transpose()?,
             database: match url.path().strip_prefix('/') {
-                Some(s) if !s.is_empty() => Some(percent_decode_cstring(s, "database")?),
+                Some(s) if !s.is_empty() => Some(percent_decode(s)?),
                 _ => None,
             },
             ..Opts::default()
@@ -311,7 +307,7 @@ impl TryFrom<&Url> for Opts {
                     };
                 }
                 "application_name" => {
-                    opts.application_name = Some(url_parameter_value(&key, value)?);
+                    opts.application_name = Some(value.into_owned());
                 }
                 "upgrade_to_unix_socket" => {
                     opts.upgrade_to_unix_socket = match value.as_ref() {
@@ -351,13 +347,7 @@ impl TryFrom<&Url> for Opts {
                     opts.client_timeout.tcp_keepalive_count = parse_positive(&key, &value)?;
                 }
                 _ => {
-                    let parameter_value = url_parameter_value(&key, value)?;
-                    let Ok(parameter_name) = into_cstring(key) else {
-                        return Err(Error::InvalidUsage(
-                            "NUL byte in a URL parameter name".into(),
-                        ));
-                    };
-                    opts.params.push((parameter_name, parameter_value));
+                    opts.params.push((key.into_owned(), value.into_owned()));
                 }
             }
         }
@@ -392,30 +382,11 @@ fn parse_positive(key: &str, value: &str) -> Result<u32, Error> {
         .ok_or_else(|| Error::InvalidUsage(format!("Invalid {}: {}", key, value)))
 }
 
-fn into_cstring(text: Cow<'_, str>) -> Result<CString, NulError> {
-    match text {
-        Cow::Borrowed(borrowed) => CString::new(borrowed),
-        Cow::Owned(owned) => CString::new(owned),
-    }
-}
-
-fn url_parameter_value(key: &str, value: Cow<'_, str>) -> Result<CString, Error> {
-    let Ok(parameter_value) = into_cstring(value) else {
-        return Err(Error::InvalidUsage(format!(
-            "NUL byte in the value of URL parameter {key:?}"
-        )));
-    };
-    Ok(parameter_value)
-}
-
-fn percent_decode_cstring(s: &str, url_part: &str) -> Result<CString, Error> {
-    let decoded = percent_encoding::percent_decode_str(s)
+fn percent_decode(s: &str) -> Result<String, Error> {
+    percent_encoding::percent_decode_str(s)
         .decode_utf8()
-        .map_err(|e| Error::InvalidUsage(format!("Invalid UTF-8 in URL: {}", e)))?;
-    let Ok(cstring) = into_cstring(decoded) else {
-        return Err(Error::InvalidUsage(format!("NUL byte in URL {url_part}")));
-    };
-    Ok(cstring)
+        .map(|s| s.into_owned())
+        .map_err(|e| Error::InvalidUsage(format!("Invalid UTF-8 in URL: {}", e)))
 }
 
 #[cfg(test)]
@@ -425,24 +396,24 @@ mod tests {
     #[test]
     fn decodes_encoded_credentials_and_database() {
         let opts = Opts::try_from("postgres://al%40ice:p%40ss%2Fw%3Frd@localhost/my%20db").unwrap();
-        assert_eq!(opts.user.as_c_str(), c"al@ice");
-        assert_eq!(opts.password.as_deref(), Some(c"p@ss/w?rd"));
-        assert_eq!(opts.database.as_deref(), Some(c"my db"));
+        assert_eq!(opts.user.as_str(), "al@ice");
+        assert_eq!(opts.password.as_deref(), Some("p@ss/w?rd"));
+        assert_eq!(opts.database.as_deref(), Some("my db"));
     }
 
     #[test]
     fn decodes_raw_at_sign_in_password() {
         let opts = Opts::try_from("postgres://alice:p@ss@localhost/db").unwrap();
-        assert_eq!(opts.password.as_deref(), Some(c"p@ss"));
+        assert_eq!(opts.password.as_deref(), Some("p@ss"));
         assert_eq!(opts.host, "localhost");
     }
 
     #[test]
     fn keeps_plain_values() {
         let opts = Opts::try_from("postgres://alice:secret@localhost/db").unwrap();
-        assert_eq!(opts.user.as_c_str(), c"alice");
-        assert_eq!(opts.password.as_deref(), Some(c"secret"));
-        assert_eq!(opts.database.as_deref(), Some(c"db"));
+        assert_eq!(opts.user.as_str(), "alice");
+        assert_eq!(opts.password.as_deref(), Some("secret"));
+        assert_eq!(opts.database.as_deref(), Some("db"));
     }
 
     #[test]
@@ -456,7 +427,7 @@ mod tests {
         assert!(without_fn.contains("password_fn: None"), "{without_fn}");
 
         let opts = Opts {
-            password_fn: Some(Arc::new(|| Ok(c"secret".into()))),
+            password_fn: Some(Arc::new(|| Ok("secret".into()))),
             ..Opts::default()
         };
         let with_fn = format!("{opts:?}");
@@ -473,7 +444,7 @@ mod tests {
         );
 
         let opts = Opts {
-            password: Some(c"secret".into()),
+            password: Some("secret".into()),
             ..Opts::default()
         };
         let with_password = format!("{opts:?}");
@@ -607,71 +578,16 @@ mod tests {
         assert_eq!(
             opts.params,
             [
-                (c"search_path".to_owned(), c"my schema".to_owned()),
-                (c"empty".to_owned(), c"".to_owned()),
+                ("search_path".to_owned(), "my schema".to_owned()),
+                ("empty".to_owned(), "".to_owned()),
             ]
-        );
-    }
-
-    #[test]
-    fn rejects_nul_byte_in_url_parameter_value() {
-        let err = Opts::try_from("postgres://alice@localhost/db?search_path=a%00b").unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidUsage(message) if message == r#"NUL byte in the value of URL parameter "search_path""#),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn rejects_nul_byte_in_url_user() {
-        let err = Opts::try_from("postgres://al%00ice@localhost/db").unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidUsage(message) if message == "NUL byte in URL user"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn rejects_nul_byte_in_url_password() {
-        let err = Opts::try_from("postgres://alice:se%00cret@localhost/db").unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidUsage(message) if message == "NUL byte in URL password"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn rejects_nul_byte_in_url_database() {
-        let err = Opts::try_from("postgres://alice@localhost/d%00b").unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidUsage(message) if message == "NUL byte in URL database"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn rejects_nul_byte_in_application_name() {
-        let err =
-            Opts::try_from("postgres://alice@localhost/db?application_name=a%00b").unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidUsage(message) if message == r#"NUL byte in the value of URL parameter "application_name""#),
-            "{err}"
         );
     }
 
     #[test]
     fn parses_application_name_from_url() {
         let opts = Opts::try_from("postgres://alice@localhost/db?application_name=app").unwrap();
-        assert_eq!(opts.application_name.as_deref(), Some(c"app"));
-    }
-
-    #[test]
-    fn rejects_nul_byte_in_url_parameter_name() {
-        let err = Opts::try_from("postgres://alice@localhost/db?a%00b=1").unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidUsage(message) if message == "NUL byte in a URL parameter name"),
-            "{err}"
-        );
+        assert_eq!(opts.application_name.as_deref(), Some("app"));
     }
 
     #[test]
