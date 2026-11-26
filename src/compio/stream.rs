@@ -31,7 +31,7 @@ pub struct Stream {
     read_buf: Vec<u8>,
     read_pos: usize,
     #[cfg(feature = "compio-tls")]
-    server_certificate_der: Option<Vec<u8>>,
+    tls_server_end_point: Option<Vec<u8>>,
 }
 
 impl Stream {
@@ -41,7 +41,7 @@ impl Stream {
             read_buf: Vec::with_capacity(READ_BUF_CAPACITY),
             read_pos: 0,
             #[cfg(feature = "compio-tls")]
-            server_certificate_der: None,
+            tls_server_end_point: None,
         }
     }
 
@@ -52,7 +52,7 @@ impl Stream {
             read_buf: Vec::with_capacity(READ_BUF_CAPACITY),
             read_pos: 0,
             #[cfg(feature = "compio-tls")]
-            server_certificate_der: None,
+            tls_server_end_point: None,
         }
     }
 
@@ -65,8 +65,14 @@ impl Stream {
         host: &str,
         config: std::sync::Arc<rustls::ClientConfig>,
     ) -> Result<Self, crate::error::Error> {
+        let unread_len = self.available();
         match self.inner {
             StreamInner::Tcp(tcp_stream) => {
+                if unread_len != 0 {
+                    return Err(crate::error::Error::LibraryBug(
+                        "Received unencrypted data after the SSL response".into(),
+                    ));
+                }
                 let connector = futures_rustls::TlsConnector::from(config);
                 let tls_stream = connector
                     .connect(
@@ -75,17 +81,17 @@ impl Stream {
                     )
                     .await?;
                 let (_, connection) = tls_stream.get_ref();
-                let server_certificate_der = connection
+                let tls_server_end_point = connection
                     .peer_certificates()
                     .and_then(|certificates| certificates.first())
-                    .map(|certificate| certificate.to_vec());
+                    .and_then(crate::tls::tls_server_end_point);
                 // Start with a fresh read buffer after TLS handshake;
                 // any pre-TLS buffered bytes are invalid in the TLS context.
                 Ok(Self {
                     inner: StreamInner::Tls(Box::new(TlsStream::from(tls_stream))),
                     read_buf: Vec::with_capacity(READ_BUF_CAPACITY),
                     read_pos: 0,
-                    server_certificate_der,
+                    tls_server_end_point,
                 })
             }
             StreamInner::Tls(_) => Err(crate::error::Error::InvalidUsage(
@@ -99,8 +105,8 @@ impl Stream {
     }
 
     #[cfg(feature = "compio-tls")]
-    pub fn server_certificate_der(&self) -> Option<Vec<u8>> {
-        self.server_certificate_der.clone()
+    pub fn take_tls_server_end_point(&mut self) -> Option<Vec<u8>> {
+        self.tls_server_end_point.take()
     }
 
     // --- Buffered read internals ---
@@ -161,6 +167,7 @@ impl Stream {
     pub async fn read_message(
         &mut self,
         buffer_set: &mut crate::buffer_set::BufferSet,
+        max_length: Option<usize>,
     ) -> std::io::Result<()> {
         // Read 5-byte header from buffer
         self.ensure(5).await?;
@@ -169,6 +176,14 @@ impl Stream {
             .split_first_chunk::<4>()
             .ok_or_else(|| std::io::Error::other("protocol: header shorter than 5 bytes"))?;
         let length = u32::from_be_bytes(*len_bytes) as usize;
+        if let Some(max_length) = max_length
+            && length > max_length
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message length {length} exceeds the limit of {max_length}"),
+            ));
+        }
         self.read_pos += 5;
 
         let payload_len = length.saturating_sub(4);

@@ -166,6 +166,9 @@ impl ScramClient {
             } else if let Some(value) = part.strip_prefix("s=") {
                 salt_b64 = Some(value);
             } else if let Some(value) = part.strip_prefix("i=") {
+                if !matches!(value.as_bytes().first(), Some(b'1'..=b'9')) {
+                    return Err(format!("Invalid SCRAM iteration count {value:?}"));
+                }
                 iterations = value.parse().ok();
             }
         }
@@ -188,6 +191,9 @@ impl ScramClient {
         // Verify nonce starts with our client nonce
         if !combined_nonce.starts_with(&self.nonce) {
             return Err("Server nonce doesn't start with client nonce".to_string());
+        }
+        if combined_nonce.len() == self.nonce.len() {
+            return Err("Server did not append its own nonce to the client nonce".to_string());
         }
 
         // Decode salt
@@ -293,6 +299,35 @@ impl ScramClient {
         }
 
         Ok(())
+    }
+}
+
+pub struct ScramStep {
+    client: ScramClient,
+    server_first: String,
+    client_final: Option<String>,
+}
+
+impl ScramStep {
+    pub(crate) fn new(client: ScramClient, server_first: String) -> Self {
+        Self {
+            client,
+            server_first,
+            client_final: None,
+        }
+    }
+
+    pub fn run(mut self) -> crate::error::Result<Self> {
+        let client_final = self
+            .client
+            .process_server_first(&self.server_first)
+            .map_err(crate::error::Error::Auth)?;
+        self.client_final = Some(client_final);
+        Ok(self)
+    }
+
+    pub(crate) fn into_client_and_client_final(self) -> (ScramClient, Option<String>) {
+        (self.client, self.client_final)
     }
 }
 
@@ -459,6 +494,49 @@ mod tests {
     }
 
     #[test]
+    fn scram_requires_server_nonce_extending_client_nonce() {
+        let mut scram = ScramClient::new(c"secret");
+        let client_nonce = scram
+            .client_first_message()
+            .strip_prefix("n,,n=,r=")
+            .unwrap()
+            .to_string();
+        let truncated = &client_nonce[..client_nonce.len() - 1];
+        for (server_nonce, expected) in [
+            (
+                String::new(),
+                "Server nonce doesn't start with client nonce",
+            ),
+            (
+                truncated.to_string(),
+                "Server nonce doesn't start with client nonce",
+            ),
+            (
+                format!("x{client_nonce}"),
+                "Server nonce doesn't start with client nonce",
+            ),
+            (
+                client_nonce.clone(),
+                "Server did not append its own nonce to the client nonce",
+            ),
+        ] {
+            let server_first = format!("r={server_nonce},s=c2FsdA==,i=4096");
+            assert_eq!(
+                scram.process_server_first(&server_first).unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                scram.verify_server_final("v=AAAA").unwrap_err(),
+                "Missing salted password"
+            );
+        }
+
+        let server_first = format!("r={client_nonce}x,s=c2FsdA==,i=4096");
+        let client_final = scram.process_server_first(&server_first).unwrap();
+        assert!(client_final.starts_with(&format!("c=biws,r={client_nonce}x,p=")));
+    }
+
+    #[test]
     fn scram_rejects_iterations_above_maximum() {
         for iterations in [MAX_SCRAM_ITERATIONS + 1, u32::MAX] {
             let mut scram = ScramClient::new(c"secret");
@@ -484,7 +562,7 @@ mod tests {
 
     #[test]
     fn scram_rejects_iterations_below_minimum() {
-        for iterations in [0, 1, MIN_SCRAM_ITERATIONS - 1] {
+        for iterations in [1, MIN_SCRAM_ITERATIONS - 1] {
             let mut scram = ScramClient::new(c"secret");
             let server_first = format!(
                 "r={}server,s={},i={iterations}",
@@ -494,6 +572,36 @@ mod tests {
             assert_eq!(
                 scram.process_server_first(&server_first).unwrap_err(),
                 format!("SCRAM iteration count {iterations} is below the minimum of 4096")
+            );
+            assert_eq!(
+                scram.verify_server_final("v=AAAA").unwrap_err(),
+                "Missing salted password"
+            );
+        }
+    }
+
+    #[test]
+    fn scram_rejects_malformed_iterations() {
+        for (iterations, expected) in [
+            ("0", "Invalid SCRAM iteration count \"0\""),
+            ("", "Invalid SCRAM iteration count \"\""),
+            ("+4096", "Invalid SCRAM iteration count \"+4096\""),
+            ("04096", "Invalid SCRAM iteration count \"04096\""),
+            ("-1", "Invalid SCRAM iteration count \"-1\""),
+            (" 4096", "Invalid SCRAM iteration count \" 4096\""),
+            ("4096x", "Missing iterations in server-first-message"),
+            ("99999999999", "Missing iterations in server-first-message"),
+        ] {
+            let mut scram = ScramClient::new(c"secret");
+            let server_first = format!(
+                "r={}server,s={},i={iterations}",
+                scram.nonce,
+                encode(b"salt")
+            );
+            assert_eq!(
+                scram.process_server_first(&server_first).unwrap_err(),
+                expected,
+                "{iterations:?}"
             );
             assert_eq!(
                 scram.verify_server_final("v=AAAA").unwrap_err(),

@@ -37,6 +37,11 @@ impl Stream {
     ) -> Result<Self, crate::error::Error> {
         match self {
             Stream::Tcp(buf_reader) => {
+                if !buf_reader.buffer().is_empty() {
+                    return Err(crate::error::Error::LibraryBug(
+                        "Received unencrypted data after the SSL response".into(),
+                    ));
+                }
                 let tcp_stream = buf_reader.into_inner();
                 let connector = tokio_rustls::TlsConnector::from(config);
                 let tls_stream = connector
@@ -55,11 +60,11 @@ impl Stream {
     }
 
     #[cfg(feature = "tokio-tls")]
-    pub fn server_certificate_der(&self) -> Option<Vec<u8>> {
+    pub fn tls_server_end_point(&self) -> Option<Vec<u8>> {
         match self {
             Stream::Tls(buf_reader) => {
                 let (_, connection) = buf_reader.get_ref().get_ref();
-                Some(connection.peer_certificates()?.first()?.to_vec())
+                crate::tls::tls_server_end_point(connection.peer_certificates()?.first()?)
             }
             Stream::Tcp(_) => None,
             #[cfg(unix)]
@@ -81,12 +86,21 @@ impl Stream {
     pub async fn read_message(
         &mut self,
         buffer_set: &mut crate::buffer_set::BufferSet,
+        max_length: Option<usize>,
     ) -> std::io::Result<()> {
         buffer_set.type_byte = self.read_u8().await?;
 
         let mut length_bytes = [0u8; 4];
         self.read_exact(&mut length_bytes).await?;
         let length = u32::from_be_bytes(length_bytes) as usize;
+        if let Some(max_length) = max_length
+            && length > max_length
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message length {length} exceeds the limit of {max_length}"),
+            ));
+        }
 
         let payload_len = length.saturating_sub(4);
         buffer_set.read_buffer.clear();

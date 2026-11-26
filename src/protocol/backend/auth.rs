@@ -224,6 +224,12 @@ impl<'a> NegotiateProtocolVersion<'a> {
             unrecognized_options.push(option);
             rest = remaining;
         }
+        if !rest.is_empty() {
+            return Err(Error::LibraryBug(format!(
+                "NegotiateProtocolVersion: {} trailing bytes after the protocol options",
+                rest.len()
+            )));
+        }
 
         Ok(Self {
             newest_version,
@@ -334,6 +340,26 @@ mod tests {
             let err = NegotiateProtocolVersion::parse(&payload, sent_option_count).unwrap_err();
             assert!(matches!(err, Error::LibraryBug(_)), "{payload:?}: {err}");
             assert!(!is_option_count_rejection(&err), "{payload:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn negotiate_parse_rejects_trailing_bytes() {
+        for (num_options, options, trailing) in [
+            (0, &[][..], &b"\0"[..]),
+            (0, &[], b"_pq_.x"),
+            (1, &[&b"_pq_.x"[..]], b"\0"),
+            (1, &[b"_pq_.x"], b"_pq_.y\0"),
+        ] {
+            let mut payload = negotiate_payload(0x0003_0000, num_options, options);
+            payload.extend_from_slice(trailing);
+            for sent_option_count in [1, 2] {
+                let err = NegotiateProtocolVersion::parse(&payload, sent_option_count).unwrap_err();
+                assert!(
+                    matches!(&err, Error::LibraryBug(message) if message.contains(&format!("{} trailing bytes", trailing.len()))),
+                    "{payload:?}: {err}"
+                );
+            }
         }
     }
 

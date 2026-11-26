@@ -38,6 +38,8 @@ pub enum Action {
     /// After successful handshake, call `step()` again.
     TlsHandshake,
 
+    ScramStep,
+
     #[cfg(feature = "auth-gss")]
     GssStep,
 

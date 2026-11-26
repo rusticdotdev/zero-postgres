@@ -16,7 +16,7 @@ use crate::protocol::frontend::write_terminate;
 use crate::protocol::types::TransactionStatus;
 use crate::state::StateMachine;
 use crate::state::action::Action;
-use crate::state::connection::ConnectionStateMachine;
+use crate::state::connection::{ConnectionStateMachine, MAX_STARTUP_MESSAGE_LENGTH};
 use crate::state::extended::{BindStateMachine, ExtendedQueryStateMachine, PreparedStatement};
 use crate::statement::{IntoStatement, StatementRef};
 
@@ -100,7 +100,9 @@ impl Conn {
                     state_machine.set_ssl_response(byte);
                 }
                 Action::ReadMessage => {
-                    stream.read_message(&mut buffer_set).await?;
+                    stream
+                        .read_message(&mut buffer_set, Some(MAX_STARTUP_MESSAGE_LENGTH))
+                        .await?;
                 }
                 Action::Write => {
                     let buf = std::mem::take(&mut buffer_set.write_buffer);
@@ -115,15 +117,17 @@ impl Conn {
                     buffer_set.write_buffer = buf;
                     result?;
                     stream.flush().await?;
-                    stream.read_message(&mut buffer_set).await?;
+                    stream
+                        .read_message(&mut buffer_set, Some(MAX_STARTUP_MESSAGE_LENGTH))
+                        .await?;
                 }
                 Action::TlsHandshake => {
                     #[cfg(feature = "compio-tls")]
                     {
                         let config = crate::tls::client_config(&options)?;
                         stream = stream.upgrade_to_tls(&options.host, config).await?;
-                        if let Some(server_certificate_der) = stream.server_certificate_der() {
-                            state_machine.set_server_certificate_der(server_certificate_der);
+                        if let Some(tls_server_end_point) = stream.take_tls_server_end_point() {
+                            state_machine.set_tls_server_end_point(tls_server_end_point);
                         }
                     }
                     #[cfg(not(feature = "compio-tls"))]
@@ -132,6 +136,13 @@ impl Conn {
                             "TLS requested but compio-tls feature not enabled".into(),
                         ));
                     }
+                }
+                Action::ScramStep => {
+                    let scram_step = state_machine.take_scram_step()?;
+                    let scram_step = compio::runtime::spawn_blocking(move || scram_step.run())
+                        .await
+                        .map_err(|e| Error::LibraryBug(format!("SCRAM step task failed: {e}")))??;
+                    state_machine.finish_scram_step(scram_step);
                 }
                 #[cfg(feature = "auth-gss")]
                 Action::GssStep => {
@@ -143,7 +154,9 @@ impl Conn {
                 }
                 Action::HandleAsyncMessageAndReadMessage(_) => {
                     // Ignore async messages during startup, read next message
-                    stream.read_message(&mut buffer_set).await?;
+                    stream
+                        .read_message(&mut buffer_set, Some(MAX_STARTUP_MESSAGE_LENGTH))
+                        .await?;
                 }
                 Action::Error(_) => {
                     return Err(Error::LibraryBug(
@@ -296,7 +309,7 @@ impl Conn {
         loop {
             match state_machine.step(&mut conn.buffer_set)? {
                 Action::ReadMessage => {
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Action::Write => {
                     let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
@@ -311,7 +324,7 @@ impl Conn {
                     conn.buffer_set.write_buffer = buf;
                     result?;
                     conn.stream.flush().await?;
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Action::Finished => {
                     std::mem::DropGuard::dismiss(guard);
@@ -360,7 +373,7 @@ impl Conn {
                     ));
                 }
                 Action::ReadMessage => {
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Action::Write => {
                     let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
@@ -375,11 +388,16 @@ impl Conn {
                     conn.buffer_set.write_buffer = buf;
                     result?;
                     conn.stream.flush().await?;
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Action::TlsHandshake => {
                     return Err(Error::LibraryBug(
                         "Unexpected TlsHandshake in query state machine".into(),
+                    ));
+                }
+                Action::ScramStep => {
+                    return Err(Error::LibraryBug(
+                        "Unexpected ScramStep in query state machine".into(),
                     ));
                 }
                 #[cfg(feature = "auth-gss")]
@@ -393,7 +411,7 @@ impl Conn {
                         h(&async_msg);
                     }
                     // Read next message after handling async message
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Action::Error(server_error) => {
                     conn.transaction_status = state_machine.transaction_status();
@@ -543,7 +561,7 @@ impl Conn {
         loop {
             match state_machine.step(&mut conn.buffer_set)? {
                 Action::ReadMessage => {
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Action::WriteAndReadMessage => {
                     let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
@@ -551,7 +569,7 @@ impl Conn {
                     conn.buffer_set.write_buffer = buf;
                     result?;
                     conn.stream.flush().await?;
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Action::Finished => {
                     conn.transaction_status = state_machine.transaction_status();
@@ -790,7 +808,7 @@ impl Conn {
             let step_result = state_machine.step(&mut conn.buffer_set);
             match step_result {
                 Ok(Action::ReadMessage) => {
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Ok(Action::WriteAndReadMessage) => {
                     let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
@@ -798,7 +816,7 @@ impl Conn {
                     conn.buffer_set.write_buffer = buf;
                     result?;
                     conn.stream.flush().await?;
-                    conn.stream.read_message(&mut conn.buffer_set).await?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Ok(Action::Finished) => {
                     std::mem::DropGuard::dismiss(guard);
@@ -893,7 +911,7 @@ impl Conn {
         let mut pending_error: Option<Error> = None;
 
         loop {
-            conn.stream.read_message(&mut conn.buffer_set).await?;
+            conn.stream.read_message(&mut conn.buffer_set, None).await?;
             let type_byte = conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
@@ -968,7 +986,7 @@ impl Conn {
         self.stream.flush().await?;
 
         loop {
-            self.stream.read_message(&mut self.buffer_set).await?;
+            self.stream.read_message(&mut self.buffer_set, None).await?;
             let type_byte = self.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
@@ -1042,7 +1060,7 @@ impl Conn {
         let mut column_buffer: Vec<u8> = Vec::new();
 
         loop {
-            conn.stream.read_message(&mut conn.buffer_set).await?;
+            conn.stream.read_message(&mut conn.buffer_set, None).await?;
             let type_byte = conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
@@ -1143,7 +1161,7 @@ impl Conn {
             loop {
                 match state_machine.step(&mut conn.buffer_set)? {
                     Action::ReadMessage => {
-                        conn.stream.read_message(&mut conn.buffer_set).await?;
+                        conn.stream.read_message(&mut conn.buffer_set, None).await?;
                     }
                     Action::Write => {
                         let buf = std::mem::take(&mut conn.buffer_set.write_buffer);
@@ -1158,7 +1176,7 @@ impl Conn {
                         conn.buffer_set.write_buffer = buf;
                         result?;
                         conn.stream.flush().await?;
-                        conn.stream.read_message(&mut conn.buffer_set).await?;
+                        conn.stream.read_message(&mut conn.buffer_set, None).await?;
                     }
                     Action::Finished => break,
                     _ => return Err(Error::LibraryBug("Unexpected action in bind".into())),
@@ -1212,7 +1230,7 @@ impl Conn {
         conn.stream.flush().await?;
 
         loop {
-            conn.stream.read_message(&mut conn.buffer_set).await?;
+            conn.stream.read_message(&mut conn.buffer_set, None).await?;
             let type_byte = conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {

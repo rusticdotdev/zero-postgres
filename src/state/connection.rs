@@ -11,7 +11,7 @@ use crate::protocol::backend::{
     AuthenticationMessage, BackendKeyData, ErrorResponse, NegotiateProtocolVersion,
     ParameterStatus, RawMessage, ReadyForQuery, msg_type,
 };
-use crate::protocol::frontend::auth::ScramClient;
+use crate::protocol::frontend::auth::{ScramClient, ScramStep};
 #[cfg(feature = "auth-gss")]
 use crate::protocol::frontend::write_gss_response;
 use crate::protocol::frontend::{
@@ -25,6 +25,8 @@ use super::StateMachine;
 use super::action::{Action, AsyncMessage};
 use crate::buffer_set::BufferSet;
 
+pub const MAX_STARTUP_MESSAGE_LENGTH: usize = 30_000;
+
 /// Connection state during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -33,6 +35,8 @@ enum State {
     WaitingTlsHandshake,
     WaitingAuth,
     SaslInProgress,
+    ScramStepPending,
+    ScramStepFinished,
     OauthInProgress,
     OauthFailed,
     #[cfg(feature = "auth-gss")]
@@ -54,6 +58,7 @@ pub struct ConnectionStateMachine<'a> {
     server_params: Vec<(String, String)>,
     transaction_status: TransactionStatus,
     scram_client: Option<ScramClient>,
+    scram_step: Option<ScramStep>,
     #[cfg(feature = "auth-gss")]
     gss_client: Option<GssClient>,
     #[cfg(feature = "auth-gss")]
@@ -62,7 +67,7 @@ pub struct ConnectionStateMachine<'a> {
     ssl_response: u8,
     /// Whether the driver can perform a TLS handshake
     tls_supported: bool,
-    server_certificate_der: Option<Vec<u8>>,
+    tls_server_end_point: Option<Vec<u8>>,
 }
 
 impl<'a> ConnectionStateMachine<'a> {
@@ -77,32 +82,19 @@ impl<'a> ConnectionStateMachine<'a> {
             server_params: Vec::new(),
             transaction_status: TransactionStatus::Idle,
             scram_client: None,
+            scram_step: None,
             #[cfg(feature = "auth-gss")]
             gss_client: None,
             #[cfg(feature = "auth-gss")]
             gss_step: None,
             ssl_response: 0,
             tls_supported,
-            server_certificate_der: None,
+            tls_server_end_point: None,
         }
     }
 
-    pub fn set_server_certificate_der(&mut self, server_certificate_der: Vec<u8>) {
-        self.server_certificate_der = Some(server_certificate_der);
-    }
-
-    fn tls_server_end_point(&self) -> Option<Vec<u8>> {
-        #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
-        {
-            let server_certificate_der = self.server_certificate_der.as_deref()?;
-            crate::tls::tls_server_end_point(&rustls::pki_types::CertificateDer::from(
-                server_certificate_der,
-            ))
-        }
-        #[cfg(not(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls")))]
-        {
-            None
-        }
+    pub fn set_tls_server_end_point(&mut self, tls_server_end_point: Vec<u8>) {
+        self.tls_server_end_point = Some(tls_server_end_point);
     }
 
     /// Get the backend key data (for cancellation).
@@ -174,27 +166,34 @@ impl<'a> ConnectionStateMachine<'a> {
     }
 
     fn write_startup_message(&self, write_buffer: &mut Vec<u8>) -> Result<()> {
-        let mut params: Vec<(&CStr, &CStr)> =
-            vec![(c"user", &self.options.user), (c"client_encoding", c"UTF8")];
-
-        if let Some(db) = &self.options.database {
-            params.push((c"database", db));
+        if self.options.params.iter().any(|(name, _)| name.is_empty()) {
+            return Err(Error::InvalidUsage(
+                "Empty parameter name in Opts::params".into(),
+            ));
         }
 
-        if let Some(app) = &self.options.application_name {
-            params.push((c"application_name", app));
-        }
-
-        for (name, value) in &self.options.params {
-            if name.is_empty() {
-                return Err(Error::InvalidUsage(
-                    "Empty parameter name in Opts::params".into(),
-                ));
-            }
-            params.push((name, value));
-        }
-
-        write_startup(write_buffer, &params);
+        let user: &CStr = &self.options.user;
+        let params = [(c"user", user), (c"client_encoding", c"UTF8")]
+            .into_iter()
+            .chain(
+                self.options
+                    .database
+                    .as_deref()
+                    .map(|database| (c"database", database)),
+            )
+            .chain(
+                self.options
+                    .application_name
+                    .as_deref()
+                    .map(|application_name| (c"application_name", application_name)),
+            )
+            .chain(
+                self.options
+                    .params
+                    .iter()
+                    .map(|(name, value)| (name.as_c_str(), value.as_c_str())),
+            );
+        write_startup(write_buffer, params);
         Ok(())
     }
 
@@ -299,9 +298,7 @@ impl<'a> ConnectionStateMachine<'a> {
                 Ok(Action::WriteAndReadMessage)
             }
             AuthenticationMessage::Sasl { mechanisms } => {
-                let tls_server_end_point = self.tls_server_end_point();
-
-                if let Some(channel_binding_data) = &tls_server_end_point
+                if let Some(channel_binding_data) = &self.tls_server_end_point
                     && mechanisms.contains(&"SCRAM-SHA-256-PLUS")
                 {
                     let password = self.required_password()?;
@@ -323,7 +320,7 @@ impl<'a> ConnectionStateMachine<'a> {
 
                 if mechanisms.contains(&"SCRAM-SHA-256") {
                     let password = self.required_password()?;
-                    let scram = if tls_server_end_point.is_some() {
+                    let scram = if self.tls_server_end_point.is_some() {
                         ScramClient::new_with_unadvertised_channel_binding(&password)
                     } else {
                         ScramClient::new(&password)
@@ -510,6 +507,37 @@ impl<'a> ConnectionStateMachine<'a> {
         }
     }
 
+    pub fn take_scram_step(&mut self) -> Result<ScramStep> {
+        if self.state != State::ScramStepPending {
+            return Err(Error::LibraryBug("No SCRAM step is pending".into()));
+        }
+        self.scram_step
+            .take()
+            .ok_or_else(|| Error::LibraryBug("SCRAM step already taken".into()))
+    }
+
+    pub fn finish_scram_step(&mut self, scram_step: ScramStep) {
+        self.scram_step = Some(scram_step);
+        self.state = State::ScramStepFinished;
+    }
+
+    fn handle_scram_step_finished(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
+        let (client, client_final) = self
+            .scram_step
+            .take()
+            .ok_or_else(|| Error::LibraryBug("SCRAM step not finished".into()))?
+            .into_client_and_client_final();
+        let client_final = client_final.ok_or_else(|| {
+            Error::LibraryBug("SCRAM step finished without a client-final-message".into())
+        })?;
+        self.scram_client = Some(client);
+
+        buffer_set.write_buffer.clear();
+        write_sasl_response(&mut buffer_set.write_buffer, client_final.as_bytes());
+        self.state = State::SaslInProgress;
+        Ok(Action::WriteAndReadMessage)
+    }
+
     fn handle_sasl_message(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
         let type_byte = buffer_set.type_byte;
         if type_byte != msg_type::AUTHENTICATION {
@@ -523,22 +551,17 @@ impl<'a> ConnectionStateMachine<'a> {
 
         match auth {
             AuthenticationMessage::SaslContinue { data } => {
-                let scram = self
-                    .scram_client
-                    .as_mut()
-                    .ok_or_else(|| Error::LibraryBug("SCRAM client not initialized".into()))?;
-
                 let server_first = simdutf8::compat::from_utf8(data)
                     .map_err(|e| Error::Auth(format!("Invalid server-first-message: {}", e)))?;
 
-                let client_final = scram
-                    .process_server_first(server_first)
-                    .map_err(Error::Auth)?;
+                let scram = self
+                    .scram_client
+                    .take()
+                    .ok_or_else(|| Error::LibraryBug("SCRAM client not initialized".into()))?;
 
-                buffer_set.write_buffer.clear();
-                write_sasl_response(&mut buffer_set.write_buffer, client_final.as_bytes());
-                self.state = State::SaslInProgress;
-                Ok(Action::WriteAndReadMessage)
+                self.scram_step = Some(ScramStep::new(scram, server_first.to_owned()));
+                self.state = State::ScramStepPending;
+                Ok(Action::ScramStep)
             }
             AuthenticationMessage::SaslFinal { data } => {
                 let scram = self
@@ -655,6 +678,12 @@ impl StateMachine for ConnectionStateMachine<'_> {
             State::Initial => return self.handle_initial(buffer_set),
             State::WaitingSslResponse => return self.handle_ssl_response(buffer_set),
             State::WaitingTlsHandshake => return self.handle_tls_handshake_complete(buffer_set),
+            State::ScramStepPending => {
+                return Err(Error::LibraryBug(
+                    "step() called before the SCRAM step finished".into(),
+                ));
+            }
+            State::ScramStepFinished => return self.handle_scram_step_finished(buffer_set),
             #[cfg(feature = "auth-gss")]
             State::GssStepPending => {
                 return Err(Error::LibraryBug(
@@ -1155,6 +1184,26 @@ mod tests {
         buffer_set.type_byte = type_byte;
         buffer_set.read_buffer.clear();
         buffer_set.read_buffer.extend_from_slice(payload);
+        machine.step(buffer_set)
+    }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    fn feed_server_first(
+        machine: &mut ConnectionStateMachine,
+        buffer_set: &mut BufferSet,
+        server_first: &str,
+    ) -> Result<Action> {
+        let action = feed(
+            machine,
+            buffer_set,
+            msg_type::AUTHENTICATION,
+            &auth_payload(11, server_first.as_bytes()),
+        )?;
+        if !matches!(action, Action::ScramStep) {
+            return Ok(action);
+        }
+        let scram_step = machine.take_scram_step()?.run()?;
+        machine.finish_scram_step(scram_step);
         machine.step(buffer_set)
     }
 
@@ -1842,9 +1891,22 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
     fn decode_base64(encoded: &str) -> Vec<u8> {
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap()
     }
+
+    #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
+    fn set_server_certificate(machine: &mut ConnectionStateMachine, encoded_certificate: &str) {
+        let certificate =
+            rustls::pki_types::CertificateDer::from(decode_base64(encoded_certificate));
+        if let Some(tls_server_end_point) = crate::tls::tls_server_end_point(&certificate) {
+            machine.set_tls_server_end_point(tls_server_end_point);
+        }
+    }
+
+    #[cfg(not(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls")))]
+    fn set_server_certificate(_machine: &mut ConnectionStateMachine, _encoded_certificate: &str) {}
 
     fn secret_password_opts() -> Opts {
         Opts {
@@ -1860,7 +1922,7 @@ mod tests {
     ) -> (ConnectionStateMachine<'a>, BufferSet) {
         let mut machine = auth_machine(options);
         if let Some(encoded_certificate) = encoded_certificate {
-            machine.set_server_certificate_der(decode_base64(encoded_certificate));
+            set_server_certificate(&mut machine, encoded_certificate);
         }
         let mut buffer_set = BufferSet::new();
         let action = feed(
@@ -1901,6 +1963,72 @@ mod tests {
             let (mechanism, client_first) = sasl_initial_response(&buffer_set.write_buffer);
             assert_eq!(mechanism, "SCRAM-SHA-256");
             assert!(client_first.starts_with("n,,n=,r="), "{client_first}");
+        }
+    }
+
+    #[test]
+    fn sasl_continue_hands_scram_step_to_driver() {
+        for iterations in [4095, 4096] {
+            let options = secret_password_opts();
+            let (mut machine, mut buffer_set) = start_sasl(&options, None, &["SCRAM-SHA-256"]);
+            let (_, client_first) = sasl_initial_response(&buffer_set.write_buffer);
+            let client_nonce = client_first.strip_prefix("n,,n=,r=").unwrap().to_string();
+
+            assert!(matches!(
+                machine.take_scram_step(),
+                Err(Error::LibraryBug(_))
+            ));
+            assert_eq!(machine.state, State::SaslInProgress);
+
+            let server_first = format!("r={client_nonce}server,s=c2FsdA==,i={iterations}");
+            let scram_action = feed(
+                &mut machine,
+                &mut buffer_set,
+                msg_type::AUTHENTICATION,
+                &auth_payload(11, server_first.as_bytes()),
+            )
+            .unwrap();
+            assert!(
+                matches!(scram_action, Action::ScramStep),
+                "{scram_action:?}"
+            );
+            assert_eq!(machine.state, State::ScramStepPending);
+
+            let step_err = machine.step(&mut buffer_set).unwrap_err();
+            assert!(matches!(step_err, Error::LibraryBug(_)), "{step_err}");
+            assert_eq!(machine.state, State::ScramStepPending);
+
+            let scram_step = machine.take_scram_step().ok().unwrap();
+            assert!(matches!(
+                machine.take_scram_step(),
+                Err(Error::LibraryBug(_))
+            ));
+
+            if iterations < 4096 {
+                let run_err = scram_step.run().err().unwrap();
+                assert!(
+                    matches!(&run_err, Error::Auth(message) if message.contains("below the minimum of 4096")),
+                    "{run_err}"
+                );
+                continue;
+            }
+
+            let finished_scram_step = scram_step.run().ok().unwrap();
+            machine.finish_scram_step(finished_scram_step);
+            let action = machine.step(&mut buffer_set).unwrap();
+            assert!(matches!(action, Action::WriteAndReadMessage), "{action:?}");
+            assert_eq!(machine.state, State::SaslInProgress);
+            assert_eq!(buffer_set.write_buffer[0], b'p');
+            let client_final = std::str::from_utf8(&buffer_set.write_buffer[5..]).unwrap();
+            assert!(
+                client_final.starts_with(&format!("c=biws,r={client_nonce}server,p=")),
+                "{client_final}"
+            );
+
+            assert!(matches!(
+                machine.take_scram_step(),
+                Err(Error::LibraryBug(_))
+            ));
         }
     }
 
@@ -1966,7 +2094,7 @@ mod tests {
             ..Opts::default()
         };
         let mut machine = auth_machine(&options);
-        machine.set_server_certificate_der(decode_base64(ED25519_CERTIFICATE));
+        set_server_certificate(&mut machine, ED25519_CERTIFICATE);
         let mut buffer_set = BufferSet::new();
         let err = feed(
             &mut machine,
@@ -2001,12 +2129,7 @@ mod tests {
         assert_eq!(machine.state, State::SaslInProgress);
 
         let server_first = format!("r={client_nonce}server,s=c2FsdA==,i=4096");
-        let action = feed(
-            &mut machine,
-            &mut buffer_set,
-            msg_type::AUTHENTICATION,
-            &auth_payload(11, server_first.as_bytes()),
-        );
+        let action = feed_server_first(&mut machine, &mut buffer_set, &server_first);
         assert!(matches!(action, Ok(Action::WriteAndReadMessage)));
         assert_eq!(machine.state, State::SaslInProgress);
 
@@ -2049,7 +2172,7 @@ mod tests {
     ) -> ConnectionStateMachine<'a> {
         let mut machine = auth_machine(options);
         if let Some(encoded_certificate) = encoded_certificate {
-            machine.set_server_certificate_der(decode_base64(encoded_certificate));
+            set_server_certificate(&mut machine, encoded_certificate);
         }
         machine
     }
@@ -2281,12 +2404,7 @@ mod tests {
             .to_string();
         let server_first = format!("r={client_nonce}server,s=c2FsdA==,i=4096");
         assert!(matches!(
-            feed(
-                &mut machine,
-                &mut buffer_set,
-                msg_type::AUTHENTICATION,
-                &auth_payload(11, server_first.as_bytes()),
-            ),
+            feed_server_first(&mut machine, &mut buffer_set, &server_first),
             Ok(Action::WriteAndReadMessage)
         ));
         assert_eq!(machine.state, State::SaslInProgress);
@@ -2356,7 +2474,7 @@ mod tests {
                 ..Opts::default()
             };
             let mut machine = auth_machine(&options);
-            machine.set_server_certificate_der(decode_base64(ECDSA_SHA256_CERTIFICATE));
+            set_server_certificate(&mut machine, ECDSA_SHA256_CERTIFICATE);
             let mut buffer_set = BufferSet::new();
             let result = feed(
                 &mut machine,

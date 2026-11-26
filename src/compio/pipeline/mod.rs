@@ -228,7 +228,7 @@ impl<'a> Pipeline<'a> {
         loop {
             let mut guard = std::mem::DropGuard::new(&mut *self.conn, |conn| conn.is_broken = true);
             let conn: &mut Conn = &mut guard;
-            conn.stream.read_message(&mut conn.buffer_set).await?;
+            conn.stream.read_message(&mut conn.buffer_set, None).await?;
             std::mem::DropGuard::dismiss(guard);
             let type_byte = self.conn.buffer_set.type_byte;
 
@@ -517,7 +517,7 @@ impl<'a> Pipeline<'a> {
         loop {
             let mut guard = std::mem::DropGuard::new(&mut *self.conn, |conn| conn.is_broken = true);
             let conn: &mut Conn = &mut guard;
-            conn.stream.read_message(&mut conn.buffer_set).await?;
+            conn.stream.read_message(&mut conn.buffer_set, None).await?;
             std::mem::DropGuard::dismiss(guard);
             let type_byte = self.conn.buffer_set.type_byte;
 
