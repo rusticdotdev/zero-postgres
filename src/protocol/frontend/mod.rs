@@ -20,6 +20,15 @@ pub use extended::{
 pub use simple::write_query;
 pub use startup::{write_cancel_request, write_ssl_request, write_startup, write_terminate};
 
+pub(crate) fn reject_nul_byte(value: &str, field: &str) -> crate::error::Result<()> {
+    if memchr::memchr(0, value.as_bytes()).is_some() {
+        return Err(crate::error::Error::InvalidUsage(format!(
+            "NUL byte in {field}"
+        )));
+    }
+    Ok(())
+}
+
 /// Frontend message type bytes.
 pub mod msg_type {
     /// Password/SASL response (all auth response types use 'p')

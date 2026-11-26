@@ -14,6 +14,15 @@ fn get_conn() -> Result<Conn, Error> {
     Conn::new(db_url.as_str())
 }
 
+fn assert_nul_rejected<T>(result: Result<T, Error>, field: &str) {
+    let err = result.err();
+    let expected = format!("NUL byte in {field}");
+    assert!(
+        matches!(&err, Some(Error::InvalidUsage(message)) if *message == expected),
+        "{err:?}"
+    );
+}
+
 /// Statements the server rejects, with the SQLSTATE each must report.
 /// Covers errors raised during Parse (42P01, 42703) and during Execute (22012).
 const REJECTED: [(&str, &str); 3] = [
@@ -37,6 +46,37 @@ fn server_errors_leave_connection_usable() -> Result<(), Error> {
         .query_drop("SELECT * FROM missing_table")
         .expect_err("simple query should fail");
     assert_eq!(err.sqlstate(), Some("42P01"), "{err}");
+    conn.query_drop("SELECT 1")?;
+    Ok(())
+}
+
+#[test]
+fn nul_byte_rejection_leaves_connection_usable() -> Result<(), Error> {
+    let mut conn = get_conn()?;
+
+    assert_nul_rejected(conn.query_drop("SELECT 1\0; SELECT 2"), "query");
+    assert!(!conn.is_broken());
+    let rows: Vec<(i32,)> = conn.query_collect("SELECT 1")?;
+    assert_eq!(rows, [(1,)]);
+
+    assert_nul_rejected(conn.exec_drop("SELECT $1::int\0", (1_i32,)), "query");
+    assert!(!conn.is_broken());
+    let rows: Vec<(i32,)> = conn.exec_collect("SELECT $1::int", (2_i32,))?;
+    assert_eq!(rows, [(2,)]);
+
+    assert_nul_rejected(conn.prepare("SELECT $1::int\0"), "query");
+    assert!(!conn.is_broken());
+    let stmt = conn.prepare("SELECT $1::int")?;
+    let rows: Vec<(i32,)> = conn.exec_collect(&stmt, (3_i32,))?;
+    assert_eq!(rows, [(3,)]);
+
+    assert_nul_rejected(
+        conn.lowlevel_bind("por\0tal", &stmt.wire_name(), (4_i32,)),
+        "portal name",
+    );
+    assert!(!conn.is_broken());
+    let rows: Vec<(i32,)> = conn.exec_collect(&stmt, (5_i32,))?;
+    assert_eq!(rows, [(5,)]);
     conn.query_drop("SELECT 1")?;
     Ok(())
 }

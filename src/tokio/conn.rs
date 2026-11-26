@@ -408,7 +408,7 @@ impl Conn {
 
     /// Execute a simple query with a handler.
     pub async fn query<H: SimpleHandler>(&mut self, sql: &str, handler: &mut H) -> Result<()> {
-        let mut state_machine = SimpleQueryStateMachine::new(handler, sql);
+        let mut state_machine = SimpleQueryStateMachine::new(handler, &mut self.buffer_set, sql)?;
         let result = timeout(self.query_timeout, self.drive(&mut state_machine)).await;
         if let Err(e) = &result
             && e.is_connection_broken()
@@ -555,7 +555,7 @@ impl Conn {
         use crate::state::batch_prepare::BatchPrepareStateMachine;
 
         let mut state_machine =
-            BatchPrepareStateMachine::new(&mut self.buffer_set, queries, start_idx);
+            BatchPrepareStateMachine::new(&mut self.buffer_set, queries, start_idx)?;
 
         let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
         let conn: &mut Self = &mut guard;
@@ -598,7 +598,7 @@ impl Conn {
             idx,
             query,
             param_oids,
-        );
+        )?;
         self.drive(&mut state_machine).await?;
         state_machine
             .take_prepared_statement()
@@ -815,7 +815,7 @@ impl Conn {
 
             // For raw SQL, send Parse each chunk (reuses unnamed statement)
             if let StatementRef::Sql(sql) = stmt_ref {
-                write_parse(&mut self.buffer_set.write_buffer, "", sql, &param_oids);
+                write_parse(&mut self.buffer_set.write_buffer, "", sql, &param_oids)?;
             }
 
             // Write Bind + Execute for each param set
@@ -832,7 +832,7 @@ impl Conn {
                     params,
                     &param_oids,
                 )?;
-                write_execute(&mut self.buffer_set.write_buffer, "", 0);
+                write_execute(&mut self.buffer_set.write_buffer, "", 0)?;
             }
 
             // Send Sync
@@ -902,7 +902,7 @@ impl Conn {
     async fn close_statement_inner(&mut self, name: &str) -> Result<()> {
         let mut handler = DropHandler::new();
         let mut state_machine =
-            ExtendedQueryStateMachine::close_statement(&mut handler, &mut self.buffer_set, name);
+            ExtendedQueryStateMachine::close_statement(&mut handler, &mut self.buffer_set, name)?;
         self.drive(&mut state_machine).await
     }
 
@@ -1114,8 +1114,8 @@ impl Conn {
         use crate::protocol::frontend::{write_describe_portal, write_execute, write_flush};
 
         self.buffer_set.write_buffer.clear();
-        write_describe_portal(&mut self.buffer_set.write_buffer, portal);
-        write_execute(&mut self.buffer_set.write_buffer, portal, max_rows);
+        write_describe_portal(&mut self.buffer_set.write_buffer, portal)?;
+        write_execute(&mut self.buffer_set.write_buffer, portal, max_rows)?;
         write_flush(&mut self.buffer_set.write_buffer);
 
         let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);
@@ -1306,7 +1306,7 @@ impl Conn {
         use crate::protocol::frontend::{write_close_portal, write_flush};
 
         self.buffer_set.write_buffer.clear();
-        write_close_portal(&mut self.buffer_set.write_buffer, portal);
+        write_close_portal(&mut self.buffer_set.write_buffer, portal)?;
         write_flush(&mut self.buffer_set.write_buffer);
 
         let mut guard = std::mem::DropGuard::new(&mut *self, |conn| conn.is_broken = true);

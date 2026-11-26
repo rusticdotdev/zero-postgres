@@ -38,7 +38,7 @@ impl BatchPrepareStateMachine {
     /// Create a new batch prepare state machine.
     ///
     /// Writes all Parse + DescribeStatement messages followed by Sync to the buffer.
-    pub fn new(buffer_set: &mut BufferSet, queries: &[&str], start_idx: u64) -> Self {
+    pub fn new(buffer_set: &mut BufferSet, queries: &[&str], start_idx: u64) -> Result<Self> {
         buffer_set.write_buffer.clear();
 
         let mut statements = Vec::with_capacity(queries.len());
@@ -46,8 +46,8 @@ impl BatchPrepareStateMachine {
         for (i, query) in queries.iter().enumerate() {
             let idx = start_idx + i as u64;
             let stmt_name = format!("_zero_s_{}", idx);
-            write_parse(&mut buffer_set.write_buffer, &stmt_name, query, &[]);
-            write_describe_statement(&mut buffer_set.write_buffer, &stmt_name);
+            write_parse(&mut buffer_set.write_buffer, &stmt_name, query, &[])?;
+            write_describe_statement(&mut buffer_set.write_buffer, &stmt_name)?;
             statements.push(PreparedStatement {
                 idx,
                 param_oids: Vec::new(),
@@ -57,12 +57,12 @@ impl BatchPrepareStateMachine {
 
         write_sync(&mut buffer_set.write_buffer);
 
-        Self {
+        Ok(Self {
             state: State::Initial,
             statements,
             current_stmt: 0,
             transaction_status: TransactionStatus::Idle,
-        }
+        })
     }
 
     /// Take the prepared statements after completion.

@@ -205,10 +205,10 @@ impl<'a> Pipeline<'a> {
     fn exec_sql_inner<P: ToParams>(&mut self, sql: &str, params: &P) -> Result<()> {
         let param_oids = params.natural_oids();
         let buf = &mut self.conn.buffer_set.write_buffer;
-        write_parse(buf, "", sql, &param_oids);
+        write_parse(buf, "", sql, &param_oids)?;
         write_bind(buf, "", "", params, &param_oids)?;
-        write_describe_portal(buf, "");
-        write_execute(buf, "", 0);
+        write_describe_portal(buf, "")?;
+        write_execute(buf, "", 0)?;
         self.expectations.push_back(Expectation::ParseBindExecute);
         Ok(())
     }
@@ -222,7 +222,7 @@ impl<'a> Pipeline<'a> {
         let buf = &mut self.conn.buffer_set.write_buffer;
         write_bind(buf, "", stmt_name, params, param_oids)?;
         // Skip write_describe_portal - use cached RowDescription from PreparedStatement
-        write_execute(buf, "", 0);
+        write_execute(buf, "", 0)?;
         self.expectations.push_back(Expectation::BindExecute);
         Ok(())
     }

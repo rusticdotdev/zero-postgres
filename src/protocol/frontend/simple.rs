@@ -1,25 +1,29 @@
 //! Simple query protocol messages.
 
+use crate::error::Result;
 use crate::protocol::codec::MessageBuilder;
 
 /// Write a Query message.
 ///
 /// The query string may contain multiple SQL statements separated by semicolons.
-pub fn write_query(buf: &mut Vec<u8>, query: &str) {
+pub fn write_query(buf: &mut Vec<u8>, query: &str) -> Result<()> {
+    super::reject_nul_byte(query, "query")?;
     log::debug!("QUERY {query}");
     let mut msg = MessageBuilder::new(buf, super::msg_type::QUERY);
     msg.write_cstr(query);
     msg.finish();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     #[test]
     fn query() {
         let mut buf = Vec::new();
-        write_query(&mut buf, "SELECT 1");
+        write_query(&mut buf, "SELECT 1").unwrap();
 
         assert_eq!(buf[0], b'Q');
 
@@ -29,5 +33,16 @@ mod tests {
 
         // Query string should be "SELECT 1\0"
         assert_eq!(&buf[5..14], b"SELECT 1\0");
+    }
+
+    #[test]
+    fn query_rejects_nul_byte() {
+        let mut buf = vec![1, 2, 3];
+        let err = write_query(&mut buf, "SELECT 1\0; DROP TABLE t").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidUsage(message) if message == "NUL byte in query"),
+            "{err}"
+        );
+        assert_eq!(buf, [1, 2, 3]);
     }
 }

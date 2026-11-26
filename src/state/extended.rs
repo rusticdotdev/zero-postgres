@@ -103,14 +103,14 @@ impl<'a, H: ExtendedHandler> ExtendedQueryStateMachine<'a, H> {
         idx: u64,
         query: &str,
         param_oids: &[Oid],
-    ) -> Self {
+    ) -> Result<Self> {
         let stmt_name = format!("_zero_s_{}", idx);
         buffer_set.write_buffer.clear();
-        write_parse(&mut buffer_set.write_buffer, &stmt_name, query, param_oids);
-        write_describe_statement(&mut buffer_set.write_buffer, &stmt_name);
+        write_parse(&mut buffer_set.write_buffer, &stmt_name, query, param_oids)?;
+        write_describe_statement(&mut buffer_set.write_buffer, &stmt_name)?;
         write_sync(&mut buffer_set.write_buffer);
 
-        Self {
+        Ok(Self {
             state: State::Initial,
             handler,
             operation: Operation::Prepare,
@@ -121,7 +121,7 @@ impl<'a, H: ExtendedHandler> ExtendedQueryStateMachine<'a, H> {
                 row_desc_payload: None,
             }),
             pending_error: None,
-        }
+        })
     }
 
     /// Execute a prepared statement.
@@ -145,8 +145,8 @@ impl<'a, H: ExtendedHandler> ExtendedQueryStateMachine<'a, H> {
             params,
             param_oids,
         )?;
-        write_describe_portal(&mut buffer_set.write_buffer, "");
-        write_execute(&mut buffer_set.write_buffer, "", 0);
+        write_describe_portal(&mut buffer_set.write_buffer, "")?;
+        write_execute(&mut buffer_set.write_buffer, "", 0)?;
         write_sync(&mut buffer_set.write_buffer);
 
         Ok(Self {
@@ -174,10 +174,10 @@ impl<'a, H: ExtendedHandler> ExtendedQueryStateMachine<'a, H> {
     ) -> Result<Self> {
         let param_oids = params.natural_oids();
         buffer_set.write_buffer.clear();
-        write_parse(&mut buffer_set.write_buffer, "", sql, &param_oids);
+        write_parse(&mut buffer_set.write_buffer, "", sql, &param_oids)?;
         write_bind(&mut buffer_set.write_buffer, "", "", params, &param_oids)?;
-        write_describe_portal(&mut buffer_set.write_buffer, "");
-        write_execute(&mut buffer_set.write_buffer, "", 0);
+        write_describe_portal(&mut buffer_set.write_buffer, "")?;
+        write_execute(&mut buffer_set.write_buffer, "", 0)?;
         write_sync(&mut buffer_set.write_buffer);
 
         Ok(Self {
@@ -193,19 +193,23 @@ impl<'a, H: ExtendedHandler> ExtendedQueryStateMachine<'a, H> {
     /// Close a prepared statement.
     ///
     /// Writes Close + Sync to `buffer_set.write_buffer`.
-    pub fn close_statement(handler: &'a mut H, buffer_set: &mut BufferSet, name: &str) -> Self {
+    pub fn close_statement(
+        handler: &'a mut H,
+        buffer_set: &mut BufferSet,
+        name: &str,
+    ) -> Result<Self> {
         buffer_set.write_buffer.clear();
-        write_close_statement(&mut buffer_set.write_buffer, name);
+        write_close_statement(&mut buffer_set.write_buffer, name)?;
         write_sync(&mut buffer_set.write_buffer);
 
-        Self {
+        Ok(Self {
             state: State::Initial,
             handler,
             operation: Operation::CloseStatement,
             transaction_status: TransactionStatus::Idle,
             prepared_stmt: None,
             pending_error: None,
-        }
+        })
     }
 
     fn handle_parse(&mut self, buffer_set: &BufferSet) -> Result<Action> {
@@ -538,7 +542,7 @@ impl BindStateMachine {
     ) -> Result<Self> {
         let param_oids = params.natural_oids();
         buffer_set.write_buffer.clear();
-        write_parse(&mut buffer_set.write_buffer, "", sql, &param_oids);
+        write_parse(&mut buffer_set.write_buffer, "", sql, &param_oids)?;
         write_bind(
             &mut buffer_set.write_buffer,
             portal_name,

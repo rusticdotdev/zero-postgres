@@ -24,24 +24,27 @@ enum State {
 }
 
 /// Simple query protocol state machine.
-pub struct SimpleQueryStateMachine<'a, 'q, H> {
+pub struct SimpleQueryStateMachine<'a, H> {
     state: State,
     handler: &'a mut H,
-    query: &'q str,
     transaction_status: TransactionStatus,
     pending_error: Option<crate::error::ServerError>,
 }
 
-impl<'a, 'q, H: SimpleHandler> SimpleQueryStateMachine<'a, 'q, H> {
+impl<'a, H: SimpleHandler> SimpleQueryStateMachine<'a, H> {
     /// Create a new simple query state machine.
-    pub fn new(handler: &'a mut H, query: &'q str) -> Self {
-        Self {
+    ///
+    /// Writes Query to `buffer_set.write_buffer`.
+    pub fn new(handler: &'a mut H, buffer_set: &mut BufferSet, query: &str) -> Result<Self> {
+        buffer_set.write_buffer.clear();
+        write_query(&mut buffer_set.write_buffer, query)?;
+
+        Ok(Self {
             state: State::Initial,
             handler,
-            query,
             transaction_status: TransactionStatus::Idle,
             pending_error: None,
-        }
+        })
     }
 
     fn handle_response(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
@@ -169,12 +172,9 @@ impl<'a, 'q, H: SimpleHandler> SimpleQueryStateMachine<'a, 'q, H> {
     }
 }
 
-impl<H: SimpleHandler> StateMachine for SimpleQueryStateMachine<'_, '_, H> {
+impl<H: SimpleHandler> StateMachine for SimpleQueryStateMachine<'_, H> {
     fn step(&mut self, buffer_set: &mut BufferSet) -> Result<Action> {
-        // Initial state: write query to buffer and request send
         if self.state == State::Initial {
-            buffer_set.write_buffer.clear();
-            write_query(&mut buffer_set.write_buffer, self.query);
             self.state = State::WaitingResponse;
             return Ok(Action::WriteAndReadMessage);
         }
