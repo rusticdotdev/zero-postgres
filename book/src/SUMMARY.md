@@ -13,4 +13,4 @@
 # Advanced Topics
 
 - [Pipelining](pipelining.md)
-- [Zero-Copy Decoding](zerocopy.md)
+- [Zero-Copy Decoding]()
