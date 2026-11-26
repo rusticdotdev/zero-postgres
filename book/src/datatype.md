@@ -6,7 +6,7 @@ Widening conversions (e.g., reading `SMALLINT` as `i64`) are allowed.
 
 ## Parameter Types (Rust to PostgreSQL)
 
-| Rust Type | PostgreSQL Type | Notes |
+| Rust | PostgreSQL | Notes |
 |-----------|-----------------|-------|
 | `bool` | `BOOL` (`BOOLEAN`) | |
 | `i8` | `INT2` (`SMALLINT`) | PostgreSQL has no 1-byte integer |
@@ -29,7 +29,7 @@ Widening conversions (e.g., reading `SMALLINT` as `i64`) are allowed.
 
 PostgreSQL only has signed integer types. Decoding to unsigned Rust types (`u8`, `u16`, `u32`, `u64`) is not supported.
 
-| PostgreSQL Type | Rust Types |
+| PostgreSQL | Rust |
 |-----------------|------------|
 | `BOOL` (`BOOLEAN`) | `bool` |
 | `INT2` (`SMALLINT`) | `i16`, `i32`, `i64` |
@@ -46,56 +46,56 @@ PostgreSQL only has signed integer types. Decoding to unsigned Rust types (`u8`,
 
 Additional type support is available through feature flags.
 
-### `with-jiff` (jiff crate)
+### `with-jiff` (`jiff` crate)
 
-| Rust Type | PostgreSQL Type |
+| Rust | PostgreSQL |
 |-----------|-----------------|
 | `jiff::civil::Date` | `DATE` |
 | `jiff::civil::Time` | `TIME` |
 | `jiff::civil::DateTime` | `TIMESTAMP`, `TIMESTAMPTZ` |
 | `jiff::Timestamp` | `TIMESTAMPTZ` |
 
-| PostgreSQL Type | Rust Types |
+| PostgreSQL | Rust |
 |-----------------|------------|
 | `DATE` | `jiff::civil::Date` |
 | `TIME` | `jiff::civil::Time` |
 | `TIMESTAMP` | `jiff::civil::DateTime` |
 | `TIMESTAMPTZ` | `jiff::civil::DateTime`, `jiff::Timestamp` |
 
-### `with-time` (time crate)
+### `with-time` (`time` crate)
 
-| Rust Type | PostgreSQL Type |
+| Rust | PostgreSQL |
 |-----------|-----------------|
 | `time::Date` | `DATE` |
 | `time::Time` | `TIME` |
 | `time::PrimitiveDateTime` | `TIMESTAMP`, `TIMESTAMPTZ` |
 | `time::OffsetDateTime` | `TIMESTAMPTZ` |
 
-| PostgreSQL Type | Rust Types |
+| PostgreSQL | Rust |
 |-----------------|------------|
 | `DATE` | `time::Date` |
 | `TIME` | `time::Time` |
 | `TIMESTAMP` | `time::PrimitiveDateTime` |
 | `TIMESTAMPTZ` | `time::PrimitiveDateTime`, `time::OffsetDateTime` |
 
-### `with-uuid` (uuid crate)
+### `with-uuid` (`uuid` crate)
 
-| Rust Type | PostgreSQL Type |
+| Rust | PostgreSQL |
 |-----------|-----------------|
 | `uuid::Uuid` | `UUID` |
 
-| PostgreSQL Type | Rust Types |
+| PostgreSQL | Rust |
 |-----------------|------------|
 | `UUID` | `uuid::Uuid` |
 
-### `with-rust-decimal` (rust_decimal crate)
+### `with-rust-decimal` (`rust_decimal` crate)
 
 `rust_decimal::Decimal` uses 96-bit precision, not arbitrary precision like PostgreSQL's `NUMERIC`.
 
-| Rust Type | PostgreSQL Type |
+| Rust | PostgreSQL |
 |-----------|-----------------|
 | `rust_decimal::Decimal` | `NUMERIC` |
 
-| PostgreSQL Type | Rust Types |
+| PostgreSQL | Rust |
 |-----------------|------------|
 | `NUMERIC` | `rust_decimal::Decimal` |

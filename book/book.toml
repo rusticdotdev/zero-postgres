@@ -12,6 +12,7 @@ edition = "2024"
 git-repository-url = "https://github.com/elbaro/zero-postgres"
 git-repository-icon = "fab-github"
 site-url = "/zero-postgres/"
+additional-css = ["custom.css"]
 
 [output.html.playground]
 runnable = false
