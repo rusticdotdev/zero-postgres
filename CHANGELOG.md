@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [v0.11.0](https://github.com/rusticdotdev/zero-postgres/compare/v0.10.0...v0.11.0) - 2026-11-26
 
+### Summary
+- Add all auth methods supported by PostgresQL: SCRAM-SHA-256-PLUS, OAUTHBEARER, GSSAPI, SSPI
+- Add client-side timeout options and TCP keepalive
+- Refactor `TlsMode`
+- Reject \0 byte in the user inputs where it's disallowed
+- Add `BufferPool::soft_buffer_cap`
+- Many security hardening against malformed server packets
+- Redact secrets in `Debug` implemenations
+
 ### <!-- 0 -->New features
 - [**breaking**] add client timeout options ([#91](https://github.com/rusticdotdev/zero-postgres/pull/91))
 - channel binding for RSA-PSS certificates
@@ -15,28 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add OAUTHBEARER authentication and Opts::oauth_discovery_fn
 - add Opts::password_fn and Opts::oauth_bearer_token_fn
 - add BufferPool::soft_buffer_cap
+- [**breaking**] refactor!: introduce a new set of TlsMode
 
 ### <!-- 1 -->Bug fixes
-- reject NUL bytes while writing startup messages instead of in Opts
-- reject the separator byte in OAuth bearer tokens
-- reject NUL bytes in queries and statement and portal names
 - reject message lengths shorter than the length field
 - harden connection startup against a misbehaving server
-- [**breaking**] reject NUL bytes in passwords
 - [**breaking**] reject NUL bytes and empty names in startup parameters
-- bound the SCRAM iteration count
+- reject NUL bytes in queries and statement and portal names
 - reject invalid NegotiateProtocolVersion and ReadyForQuery fields
-- redact secret key in BackendKeyData Debug
+- redact secrets in `Debug` implementations
 - mark the connection broken when an operation stops mid-response
 
 ### <!-- 3 -->Documentation
 - add authentication methods and dynamic credentials to the book
 
 ### <!-- 9 -->Other
-- refactor: drop unused state and clones in ScramClient
-- refactor: remove unused write_gssenc_request
-- [**breaking**] refactor!: introduce a new set of TlsMode
-- refactor: remove unnecessary query_inner
 
 ## [v0.10.0](https://github.com/rusticdotdev/zero-postgres/compare/v0.9.0...v0.10.0) - 2026-11-21
 
