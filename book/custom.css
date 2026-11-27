@@ -1,3 +1,18 @@
 .table-wrapper + .table-wrapper {
     margin-block-start: 1.5em;
 }
+
+:root:has(main > h1#type-system),
+:root:has(main > h1#pg_type) {
+    --content-max-width: none;
+}
+
+main:has(> h1#pg_type) table {
+    font-size: 0.7em;
+    white-space: nowrap;
+}
+
+main:has(> h1#pg_type) table th,
+main:has(> h1#pg_type) table td {
+    padding: 1px 4px;
+}

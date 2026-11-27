@@ -10,26 +10,26 @@ Python binding: [pyro-postgres](https://github.com/rusticdotdev/pyro-postgres/).
 ## Feature Flags
 
 - `derive` (default): `#[derive(FromRow)]` and `#[derive(RefFromRow)]` macros
-- `sync` (default) - Synchronous API
-- `tokio` (default) - Asynchronous API using tokio
-- `compio` - Asynchronous API using compio (experimental)
-- `sync-tls` - TLS support for Synchronous API (experimental)
-- `tokio-tls` - TLS support for tokio (experimental)
-- `compio-tls` - TLS support for compio (experimental)
 - `diesel` - Diesel support (experimental)
 
-TLS flags use `rustls` with the platform certificate verifier.
-To trust a private CA or present a client certificate, set `Opts::tls_config`
-to a `rustls::ClientConfig` built with the re-exported `zero_postgres::rustls`.
+Runtimes:
 
-[External type supports](https://rusticdotdev.github.io/zero-postgres/datatype.html#feature-gated-types):
+- `sync` (default) - Synchronous API
+- `sync-tls` - TLS support for Synchronous API
+- `tokio` (default) - Asynchronous API using tokio
+- `tokio-tls` - TLS support for tokio
+- `compio` - Asynchronous API using compio (experimental)
+- `compio-tls` - TLS support for compio (experimental)
 
-- `with-jiff` - Support [jiff](https://crates.io/crates/jiff) date/time types
-- `with-time` - Support [time](https://crates.io/crates/time) date/time types
+[External type supports](https://rusticdotdev.github.io/zero-postgres/type_conversion.html#feature-gated-types):
+
+- `with-jiff` - Support [jiff](https://crates.io/crates/jiff) types
+- `with-time` - Support [time](https://crates.io/crates/time) types
 - `with-uuid` - Support [uuid](https://crates.io/crates/uuid) types
 - `with-rust-decimal` - Support [rust_decimal](https://crates.io/crates/rust_decimal) types
+- TODO: more decimal types
 
-Rare, expensive features:
+Other features:
 
 - `auth-gss` - enable GSSAPI / SSPI authentication.
   Requires `libkrb5-dev`, `libclang-dev`, `pkg-config`
