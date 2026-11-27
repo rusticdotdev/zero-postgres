@@ -1,6 +1,8 @@
 //! Action types for state machine I/O requests.
 
-use crate::error::ServerError;
+use crate::error::{Error, Result, ServerError};
+use crate::protocol::backend::auth::{NotificationResponse, ParameterStatus};
+use crate::protocol::backend::{NoticeResponse, RawMessage, msg_type};
 
 /// Action requested by a state machine.
 ///
@@ -82,4 +84,34 @@ pub enum AsyncMessage {
         /// New value
         value: String,
     },
+}
+
+impl AsyncMessage {
+    pub(crate) fn parse(msg: &RawMessage<'_>) -> Result<Self> {
+        match msg.type_byte {
+            msg_type::NOTICE_RESPONSE => {
+                let notice = NoticeResponse::parse(msg.payload)?;
+                Ok(Self::Notice(notice.0))
+            }
+            msg_type::PARAMETER_STATUS => {
+                let param = ParameterStatus::parse(msg.payload)?;
+                Ok(Self::ParameterChanged {
+                    name: param.name.to_string(),
+                    value: param.value.to_string(),
+                })
+            }
+            msg_type::NOTIFICATION_RESPONSE => {
+                let notification = NotificationResponse::parse(msg.payload)?;
+                Ok(Self::Notification {
+                    pid: notification.pid,
+                    channel: notification.channel.to_string(),
+                    payload: notification.payload.to_string(),
+                })
+            }
+            _ => Err(Error::LibraryBug(format!(
+                "Unknown async message type: '{}'",
+                msg.type_byte as char
+            ))),
+        }
+    }
 }

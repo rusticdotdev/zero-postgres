@@ -20,6 +20,7 @@ use crate::protocol::frontend::{
     write_startup,
 };
 use crate::protocol::types::TransactionStatus;
+use crate::reported_parameters::ReportedParameters;
 
 use super::StateMachine;
 use super::action::{Action, AsyncMessage};
@@ -55,7 +56,7 @@ pub struct ConnectionStateMachine<'a> {
     state: State,
     options: &'a Opts,
     backend_key: Option<BackendKeyData>,
-    server_params: Vec<(String, String)>,
+    server_params: ReportedParameters,
     transaction_status: TransactionStatus,
     scram_client: Option<ScramClient>,
     scram_step: Option<ScramStep>,
@@ -79,7 +80,7 @@ impl<'a> ConnectionStateMachine<'a> {
             state: State::Initial,
             options,
             backend_key: None,
-            server_params: Vec::new(),
+            server_params: ReportedParameters::default(),
             transaction_status: TransactionStatus::Idle,
             scram_client: None,
             scram_step: None,
@@ -103,7 +104,7 @@ impl<'a> ConnectionStateMachine<'a> {
     }
 
     /// Take server parameters.
-    pub fn take_server_params(&mut self) -> Vec<(String, String)> {
+    pub fn take_server_params(&mut self) -> ReportedParameters {
         std::mem::take(&mut self.server_params)
     }
 
@@ -628,8 +629,7 @@ impl<'a> ConnectionStateMachine<'a> {
             }
             msg_type::PARAMETER_STATUS => {
                 let param = ParameterStatus::parse(payload)?;
-                self.server_params
-                    .push((param.name.to_string(), param.value.to_string()));
+                self.server_params.set(param.name, param.value)?;
                 Ok(Action::ReadMessage)
             }
             msg_type::READY_FOR_QUERY => {
@@ -641,41 +641,6 @@ impl<'a> ConnectionStateMachine<'a> {
             _ => Err(Error::LibraryBug(format!(
                 "Unexpected message during startup: '{}'",
                 type_byte as char
-            ))),
-        }
-    }
-
-    fn handle_async_message(&self, msg: &RawMessage<'_>) -> Result<Action> {
-        match msg.type_byte {
-            msg_type::NOTICE_RESPONSE => {
-                let notice = crate::protocol::backend::NoticeResponse::parse(msg.payload)?;
-                Ok(Action::HandleAsyncMessageAndReadMessage(
-                    AsyncMessage::Notice(notice.0),
-                ))
-            }
-            msg_type::PARAMETER_STATUS => {
-                let param = ParameterStatus::parse(msg.payload)?;
-                Ok(Action::HandleAsyncMessageAndReadMessage(
-                    AsyncMessage::ParameterChanged {
-                        name: param.name.to_string(),
-                        value: param.value.to_string(),
-                    },
-                ))
-            }
-            msg_type::NOTIFICATION_RESPONSE => {
-                let notification =
-                    crate::protocol::backend::auth::NotificationResponse::parse(msg.payload)?;
-                Ok(Action::HandleAsyncMessageAndReadMessage(
-                    AsyncMessage::Notification {
-                        pid: notification.pid,
-                        channel: notification.channel.to_string(),
-                        payload: notification.payload.to_string(),
-                    },
-                ))
-            }
-            _ => Err(Error::LibraryBug(format!(
-                "Unknown async message type: '{}'",
-                msg.type_byte as char
             ))),
         }
     }
@@ -713,7 +678,9 @@ impl StateMachine for ConnectionStateMachine<'_> {
             && !(self.state == State::WaitingReady && type_byte == msg_type::PARAMETER_STATUS)
         {
             let msg = RawMessage::new(type_byte, &buffer_set.read_buffer);
-            return self.handle_async_message(&msg);
+            return Ok(Action::HandleAsyncMessageAndReadMessage(
+                AsyncMessage::parse(&msg)?,
+            ));
         }
 
         // Handle error response

@@ -25,9 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Print server parameters
     println!("=== Server Parameters ===");
-    for (name, value) in conn.server_params() {
-        println!("  {}: {}", name, value);
-    }
+    println!("{:#?}", conn.server_params());
     println!();
 
     // Print transaction status

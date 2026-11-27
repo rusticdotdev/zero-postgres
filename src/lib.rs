@@ -17,6 +17,7 @@ mod error;
 mod gss;
 mod opts;
 mod pipeline;
+mod reported_parameters;
 mod statement;
 #[cfg(any(feature = "sync-tls", feature = "tokio-tls", feature = "compio-tls"))]
 mod tls;
@@ -49,6 +50,7 @@ pub use error::{Error, Result, ServerError};
 pub use handler::AsyncMessageHandler;
 pub use opts::{ClientTimeout, Opts, TlsMode};
 pub use pipeline::Ticket;
+pub use reported_parameters::ReportedParameters;
 pub use state::action::AsyncMessage;
 pub use state::extended::PreparedStatement;
 pub use statement::{IntoStatement, StatementRef};

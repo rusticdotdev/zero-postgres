@@ -11,11 +11,12 @@ use crate::conversion::ToParams;
 use crate::error::{Error, Result};
 use crate::handler::{DropHandler, ExtendedHandler, FirstRowHandler, SimpleHandler};
 use crate::opts::Opts;
-use crate::protocol::backend::BackendKeyData;
+use crate::protocol::backend::{BackendKeyData, RawMessage};
 use crate::protocol::frontend::write_terminate;
 use crate::protocol::types::TransactionStatus;
+use crate::reported_parameters::ReportedParameters;
 use crate::state::StateMachine;
-use crate::state::action::Action;
+use crate::state::action::{Action, AsyncMessage};
 use crate::state::connection::{ConnectionStateMachine, MAX_STARTUP_MESSAGE_LENGTH};
 use crate::state::extended::{BindStateMachine, ExtendedQueryStateMachine, PreparedStatement};
 use crate::statement::{IntoStatement, StatementRef};
@@ -29,7 +30,7 @@ pub struct Conn {
     pub(crate) stream: Stream,
     pub(crate) buffer_set: PooledBufferSet,
     backend_key: Option<BackendKeyData>,
-    server_params: Vec<(String, String)>,
+    server_params: ReportedParameters,
     pub(crate) transaction_status: TransactionStatus,
     pub(crate) is_broken: bool,
     name_counter: u64,
@@ -255,7 +256,7 @@ impl Conn {
     }
 
     /// Get server parameters.
-    pub fn server_params(&self) -> &[(String, String)] {
+    pub fn server_params(&self) -> &ReportedParameters {
         &self.server_params
     }
 
@@ -330,6 +331,10 @@ impl Conn {
                     std::mem::DropGuard::dismiss(guard);
                     break;
                 }
+                Action::HandleAsyncMessageAndReadMessage(async_message) => {
+                    conn.handle_async_message(async_message)?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
+                }
                 _ => return Err(Error::LibraryBug("Unexpected action in bind".into())),
             }
         }
@@ -353,6 +358,22 @@ impl Conn {
     /// Remove the async message handler.
     pub fn clear_async_message_handler(&mut self) {
         self.async_message_handler = None;
+    }
+
+    fn handle_async_message(&mut self, async_message: AsyncMessage) -> Result<()> {
+        if let Some(handler) = &mut self.async_message_handler {
+            handler(&async_message);
+        }
+        if let AsyncMessage::ParameterChanged { name, value } = async_message {
+            self.server_params.set(name, value)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn handle_raw_async_message(&mut self) -> Result<()> {
+        let msg = RawMessage::new(self.buffer_set.type_byte, &self.buffer_set.read_buffer);
+        let async_message = AsyncMessage::parse(&msg)?;
+        self.handle_async_message(async_message)
     }
 
     /// Ping the server with an empty query to check connection aliveness.
@@ -407,10 +428,7 @@ impl Conn {
                     ));
                 }
                 Action::HandleAsyncMessageAndReadMessage(async_msg) => {
-                    if let Some(h) = &mut conn.async_message_handler {
-                        h(&async_msg);
-                    }
-                    // Read next message after handling async message
+                    conn.handle_async_message(async_msg)?;
                     conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 Action::Error(server_error) => {
@@ -575,6 +593,10 @@ impl Conn {
                     conn.transaction_status = state_machine.transaction_status();
                     std::mem::DropGuard::dismiss(guard);
                     break;
+                }
+                Action::HandleAsyncMessageAndReadMessage(async_message) => {
+                    conn.handle_async_message(async_message)?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
                 }
                 _ => {
                     return Err(Error::LibraryBug(
@@ -827,6 +849,10 @@ impl Conn {
                     std::mem::DropGuard::dismiss(guard);
                     return Err(Error::Server(server_error));
                 }
+                Ok(Action::HandleAsyncMessageAndReadMessage(async_message)) => {
+                    conn.handle_async_message(async_message)?;
+                    conn.stream.read_message(&mut conn.buffer_set, None).await?;
+                }
                 Ok(_) => return Err(Error::LibraryBug("Unexpected action in batch".into())),
                 Err(e) => return Err(e),
             }
@@ -915,6 +941,7 @@ impl Conn {
             let type_byte = conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
+                conn.handle_raw_async_message()?;
                 continue;
             }
 
@@ -990,6 +1017,7 @@ impl Conn {
             let type_byte = self.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
+                self.handle_raw_async_message()?;
                 continue;
             }
 
@@ -1064,6 +1092,7 @@ impl Conn {
             let type_byte = conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
+                conn.handle_raw_async_message()?;
                 continue;
             }
 
@@ -1179,6 +1208,10 @@ impl Conn {
                         conn.stream.read_message(&mut conn.buffer_set, None).await?;
                     }
                     Action::Finished => break,
+                    Action::HandleAsyncMessageAndReadMessage(async_message) => {
+                        conn.handle_async_message(async_message)?;
+                        conn.stream.read_message(&mut conn.buffer_set, None).await?;
+                    }
                     _ => return Err(Error::LibraryBug("Unexpected action in bind".into())),
                 }
             }
@@ -1234,6 +1267,7 @@ impl Conn {
             let type_byte = conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
+                conn.handle_raw_async_message()?;
                 continue;
             }
 

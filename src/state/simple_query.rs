@@ -135,41 +135,6 @@ impl<'a, H: SimpleHandler> SimpleQueryStateMachine<'a, H> {
             Ok(Action::Finished)
         }
     }
-
-    fn handle_async_message(&self, msg: &RawMessage<'_>) -> Result<Action> {
-        match msg.type_byte {
-            msg_type::NOTICE_RESPONSE => {
-                let notice = crate::protocol::backend::NoticeResponse::parse(msg.payload)?;
-                Ok(Action::HandleAsyncMessageAndReadMessage(
-                    AsyncMessage::Notice(notice.0),
-                ))
-            }
-            msg_type::PARAMETER_STATUS => {
-                let param = crate::protocol::backend::auth::ParameterStatus::parse(msg.payload)?;
-                Ok(Action::HandleAsyncMessageAndReadMessage(
-                    AsyncMessage::ParameterChanged {
-                        name: param.name.to_string(),
-                        value: param.value.to_string(),
-                    },
-                ))
-            }
-            msg_type::NOTIFICATION_RESPONSE => {
-                let notification =
-                    crate::protocol::backend::auth::NotificationResponse::parse(msg.payload)?;
-                Ok(Action::HandleAsyncMessageAndReadMessage(
-                    AsyncMessage::Notification {
-                        pid: notification.pid,
-                        channel: notification.channel.to_string(),
-                        payload: notification.payload.to_string(),
-                    },
-                ))
-            }
-            _ => Err(Error::LibraryBug(format!(
-                "Unknown async message type: '{}'",
-                msg.type_byte as char
-            ))),
-        }
-    }
 }
 
 impl<H: SimpleHandler> StateMachine for SimpleQueryStateMachine<'_, H> {
@@ -184,7 +149,9 @@ impl<H: SimpleHandler> StateMachine for SimpleQueryStateMachine<'_, H> {
         // Handle async messages
         if RawMessage::is_async_type(type_byte) {
             let msg = RawMessage::new(type_byte, &buffer_set.read_buffer);
-            return self.handle_async_message(&msg);
+            return Ok(Action::HandleAsyncMessageAndReadMessage(
+                AsyncMessage::parse(&msg)?,
+            ));
         }
 
         // Handle error response

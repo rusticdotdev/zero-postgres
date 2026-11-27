@@ -287,6 +287,7 @@ impl<'a> Pipeline<'a> {
             let type_byte = self.conn.buffer_set.type_byte;
 
             if RawMessage::is_async_type(type_byte) {
+                self.conn.handle_raw_async_message()?;
                 continue;
             }
 
@@ -585,6 +586,7 @@ impl<'a> Pipeline<'a> {
 
             // Handle async messages
             if RawMessage::is_async_type(type_byte) {
+                self.conn.handle_raw_async_message()?;
                 continue;
             }
 

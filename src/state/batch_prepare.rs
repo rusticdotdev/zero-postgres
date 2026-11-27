@@ -10,7 +10,7 @@ use crate::protocol::backend::{
 use crate::protocol::frontend::{write_describe_statement, write_parse, write_sync};
 use crate::protocol::types::TransactionStatus;
 
-use super::action::Action;
+use super::action::{Action, AsyncMessage};
 use super::extended::PreparedStatement;
 
 /// State for batch prepare flow.
@@ -85,9 +85,11 @@ impl BatchPrepareStateMachine {
 
         let type_byte = buffer_set.type_byte;
 
-        // Handle async messages - need to keep reading
         if RawMessage::is_async_type(type_byte) {
-            return Ok(Action::ReadMessage);
+            let msg = RawMessage::new(type_byte, &buffer_set.read_buffer);
+            return Ok(Action::HandleAsyncMessageAndReadMessage(
+                AsyncMessage::parse(&msg)?,
+            ));
         }
 
         // Handle error response
