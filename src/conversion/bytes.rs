@@ -81,7 +81,7 @@ impl ToWireValue for Vec<u8> {
 }
 
 /// Nibble lookup table: ASCII byte → 0x00–0x0F for valid hex, 0xFF for invalid.
-static HEX_LOOKUP: [u8; 256] = {
+pub(super) static HEX_LOOKUP: [u8; 256] = {
     let mut table = [0xFF_u8; 256];
     let mut i: usize = 0;
     while i < 256 {

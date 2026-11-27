@@ -5,6 +5,7 @@
 
 mod bool;
 mod bytes;
+mod network;
 mod number;
 mod numeric_util;
 pub mod ref_row;
