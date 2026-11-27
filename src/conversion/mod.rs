@@ -8,12 +8,14 @@ mod bytes;
 mod network;
 mod number;
 mod numeric_util;
+mod range;
 pub mod ref_row;
 mod row;
 mod std_time;
 mod string;
 
 pub use numeric_util::numeric_to_string;
+pub use range::PgRange;
 pub use std_time::Interval;
 
 #[cfg(feature = "with-rust-decimal")]
