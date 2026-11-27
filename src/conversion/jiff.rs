@@ -1,11 +1,17 @@
 //! Jiff crate type implementations (civil::Date, civil::Time, civil::DateTime, Timestamp).
 
+#[cfg(test)]
+#[path = "jiff_tests.rs"]
+mod tests;
+
 use jiff::civil::{Date, DateTime, Time};
-use jiff::{SignedDuration, Span, Timestamp};
+use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Span, Timestamp, ZonedDateTime};
 
 use crate::error::{Error, Result};
 use crate::protocol::types::{Oid, oid};
 
+use super::std_time::{INTERVAL_TEXT_UNSUPPORTED, Interval};
 use super::{FromWireValue, ToWireValue};
 
 const PG_EPOCH: Date = jiff::civil::date(2000, 1, 1);
@@ -46,9 +52,7 @@ impl FromWireValue<'_> for Date {
 }
 
 impl ToWireValue for Date {
-    fn natural_oid(&self) -> Oid {
-        oid::DATE
-    }
+    const NATURAL_OID: Oid = oid::DATE;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
@@ -58,7 +62,7 @@ impl ToWireValue for Date {
                 buf.extend_from_slice(&pg_days.to_be_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
@@ -88,19 +92,20 @@ impl FromWireValue<'_> for Time {
 }
 
 impl ToWireValue for Time {
-    fn natural_oid(&self) -> Oid {
-        oid::TIME
-    }
+    const NATURAL_OID: Oid = oid::TIME;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
             oid::TIME => {
+                if self.subsec_nanosecond() % 1000 != 0 {
+                    return Err(Error::Encode("Time has sub-microsecond precision".into()));
+                }
                 let usecs = self.duration_since(Time::midnight()).as_micros() as i64;
                 buf.extend_from_slice(&8_i32.to_be_bytes());
                 buf.extend_from_slice(&usecs.to_be_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
@@ -142,19 +147,22 @@ impl FromWireValue<'_> for DateTime {
 }
 
 impl ToWireValue for DateTime {
-    fn natural_oid(&self) -> Oid {
-        oid::TIMESTAMP
-    }
+    const NATURAL_OID: Oid = oid::TIMESTAMP;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
             oid::TIMESTAMP | oid::TIMESTAMPTZ => {
+                if self.subsec_nanosecond() % 1000 != 0 {
+                    return Err(Error::Encode(
+                        "DateTime has sub-microsecond precision".into(),
+                    ));
+                }
                 let usecs = self.duration_since(PG_EPOCH_DT).as_micros() as i64;
                 buf.extend_from_slice(&8_i32.to_be_bytes());
                 buf.extend_from_slice(&usecs.to_be_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
@@ -191,257 +199,167 @@ impl FromWireValue<'_> for Timestamp {
 }
 
 impl ToWireValue for Timestamp {
-    fn natural_oid(&self) -> Oid {
-        oid::TIMESTAMPTZ
-    }
+    const NATURAL_OID: Oid = oid::TIMESTAMPTZ;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
             oid::TIMESTAMP | oid::TIMESTAMPTZ => {
+                if self.subsec_nanosecond() % 1000 != 0 {
+                    return Err(Error::Encode(
+                        "Timestamp has sub-microsecond precision".into(),
+                    ));
+                }
                 let usecs = self.duration_since(PG_EPOCH_TS).as_micros() as i64;
                 buf.extend_from_slice(&8_i32.to_be_bytes());
                 buf.extend_from_slice(&usecs.to_be_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use jiff::civil::{date, time};
-    use jiff::tz::TimeZone;
-
-    #[test]
-    fn date_text() {
-        let date = Date::from_text(oid::DATE, b"2024-01-15").unwrap();
-        assert_eq!(date.year(), 2024);
-        assert_eq!(date.month(), 1);
-        assert_eq!(date.day(), 15);
-    }
-
-    #[test]
-    fn date_binary() {
-        // 2024-01-15 is 8780 days since 2000-01-01
-        let days: i32 = 8780;
-        let bytes = days.to_be_bytes();
-        let date = Date::from_binary(oid::DATE, &bytes).unwrap();
-        assert_eq!(date.year(), 2024);
-        assert_eq!(date.month(), 1);
-        assert_eq!(date.day(), 15);
-    }
-
-    #[test]
-    fn date_binary_before_epoch() {
-        assert_eq!(
-            Date::from_binary(oid::DATE, &(-1_i32).to_be_bytes()).unwrap(),
-            date(1999, 12, 31)
-        );
-        assert_eq!(
-            Date::from_binary(oid::DATE, &(-36_524_i32).to_be_bytes()).unwrap(),
-            date(1900, 1, 1)
-        );
-    }
-
-    #[test]
-    fn date_binary_infinity() {
-        Date::from_binary(oid::DATE, &i32::MAX.to_be_bytes()).unwrap_err();
-        Date::from_binary(oid::DATE, &i32::MIN.to_be_bytes()).unwrap_err();
-    }
-
-    #[test]
-    fn date_roundtrip() {
-        let original = date(2024, 1, 15);
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        let decoded = Date::from_binary(oid::DATE, &buf[4..]).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn date_roundtrip_before_epoch() {
-        let original = date(1900, 1, 1);
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        assert_eq!(buf[4..], (-36_524_i32).to_be_bytes());
-    }
-
-    #[test]
-    fn time_text() {
-        let time = Time::from_text(oid::TIME, b"10:30:45").unwrap();
-        assert_eq!(time.hour(), 10);
-        assert_eq!(time.minute(), 30);
-        assert_eq!(time.second(), 45);
-    }
-
-    #[test]
-    fn time_text_with_micros() {
-        let time = Time::from_text(oid::TIME, b"10:30:45.123456").unwrap();
-        assert_eq!(time.hour(), 10);
-        assert_eq!(time.minute(), 30);
-        assert_eq!(time.second(), 45);
-        assert_eq!(time.subsec_nanosecond(), 123456000);
-    }
-
-    #[test]
-    fn time_binary() {
-        // 10:30:45 = (10*3600 + 30*60 + 45) * 1_000_000 microseconds
-        let usecs: i64 = (10 * 3600 + 30 * 60 + 45) * 1_000_000;
-        let bytes = usecs.to_be_bytes();
-        let time = Time::from_binary(oid::TIME, &bytes).unwrap();
-        assert_eq!(time.hour(), 10);
-        assert_eq!(time.minute(), 30);
-        assert_eq!(time.second(), 45);
-    }
-
-    #[test]
-    fn time_binary_out_of_range() {
-        Time::from_binary(oid::TIME, &USECS_PER_DAY.to_be_bytes()).unwrap_err();
-        Time::from_binary(oid::TIME, &(-1_i64).to_be_bytes()).unwrap_err();
-    }
-
-    #[test]
-    fn time_roundtrip() {
-        let original = time(10, 30, 45, 123_456_000);
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        let decoded = Time::from_binary(oid::TIME, &buf[4..]).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn timestamp_text() {
-        let ts = DateTime::from_text(oid::TIMESTAMP, b"2024-01-15 10:30:45").unwrap();
-        assert_eq!(ts.year(), 2024);
-        assert_eq!(ts.month(), 1);
-        assert_eq!(ts.day(), 15);
-        assert_eq!(ts.hour(), 10);
-        assert_eq!(ts.minute(), 30);
-        assert_eq!(ts.second(), 45);
-    }
-
-    #[test]
-    fn timestamp_text_strips_timezone() {
-        assert_eq!(
-            DateTime::from_text(oid::TIMESTAMPTZ, b"2024-01-15 10:30:45.123456+09").unwrap(),
-            date(2024, 1, 15).at(10, 30, 45, 123_456_000)
-        );
-        assert_eq!(
-            DateTime::from_text(oid::TIMESTAMPTZ, b"2024-01-15 10:30:45-05:30").unwrap(),
-            date(2024, 1, 15).at(10, 30, 45, 0)
-        );
-    }
-
-    #[test]
-    fn timestamp_binary() {
-        // 2024-01-15 10:30:45 UTC
-        // Days since 2000-01-01: 8780
-        let day_usecs: i64 = 8780 * USECS_PER_DAY;
-        let time_usecs: i64 = (10 * 3600 + 30 * 60 + 45) * USECS_PER_SEC;
-        let total_usecs = day_usecs + time_usecs;
-        let bytes = total_usecs.to_be_bytes();
-        let ts = DateTime::from_binary(oid::TIMESTAMP, &bytes).unwrap();
-        assert_eq!(ts.year(), 2024);
-        assert_eq!(ts.month(), 1);
-        assert_eq!(ts.day(), 15);
-        assert_eq!(ts.hour(), 10);
-        assert_eq!(ts.minute(), 30);
-        assert_eq!(ts.second(), 45);
-    }
-
-    #[test]
-    fn timestamp_binary_before_epoch() {
-        assert_eq!(
-            DateTime::from_binary(oid::TIMESTAMP, &(-1_i64).to_be_bytes()).unwrap(),
-            date(1999, 12, 31).at(23, 59, 59, 999_999_000)
-        );
-        assert_eq!(
-            Timestamp::from_binary(oid::TIMESTAMPTZ, &(-1_i64).to_be_bytes()).unwrap(),
-            date(1999, 12, 31)
-                .at(23, 59, 59, 999_999_000)
-                .to_zoned_datetime(TimeZone::UTC)
-                .unwrap()
-                .timestamp()
-        );
-    }
-
-    #[test]
-    fn timestamp_binary_infinity() {
-        DateTime::from_binary(oid::TIMESTAMP, &i64::MAX.to_be_bytes()).unwrap_err();
-        DateTime::from_binary(oid::TIMESTAMP, &i64::MIN.to_be_bytes()).unwrap_err();
-        Timestamp::from_binary(oid::TIMESTAMPTZ, &i64::MAX.to_be_bytes()).unwrap_err();
-        Timestamp::from_binary(oid::TIMESTAMPTZ, &i64::MIN.to_be_bytes()).unwrap_err();
-    }
-
-    #[test]
-    fn timestamp_roundtrip() {
-        let original = date(2024, 1, 15).at(10, 30, 45, 123_456_000);
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        let decoded = DateTime::from_binary(oid::TIMESTAMP, &buf[4..]).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn timestamp_roundtrip_before_epoch() {
-        let original = date(1969, 7, 20).at(20, 17, 40, 123_456_000);
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        let decoded = DateTime::from_binary(oid::TIMESTAMP, &buf[4..]).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn timestamptz_text() {
-        let expected = date(2024, 1, 15)
-            .at(10, 30, 45, 0)
-            .to_zoned_datetime(TimeZone::UTC)
-            .unwrap()
-            .timestamp();
-        for text in [
-            "2024-01-15 10:30:45+00",
-            "2024-01-15 19:30:45+09",
-            "2024-01-15 16:00:45+05:30",
-            "2024-01-15 05:30:45-05",
-        ] {
-            assert_eq!(
-                Timestamp::from_text(oid::TIMESTAMPTZ, text.as_bytes()).unwrap(),
-                expected,
-                "{text}"
-            );
+impl FromWireValue<'_> for ZonedDateTime {
+    fn from_text(oid: Oid, bytes: &[u8]) -> Result<Self> {
+        if oid != oid::TIMESTAMPTZ {
+            return Err(Error::Decode(format!(
+                "cannot decode oid {} as ZonedDateTime",
+                oid
+            )));
         }
-        assert_eq!(
-            Timestamp::from_text(oid::TIMESTAMPTZ, b"2024-01-15 10:30:45.123456+00").unwrap(),
-            expected + SignedDuration::from_micros(123_456)
-        );
-        Timestamp::from_text(oid::TIMESTAMPTZ, b"infinity").unwrap_err();
+        Timestamp::from_text(oid, bytes).map(|timestamp| timestamp.to_zoned_datetime(TimeZone::UTC))
     }
 
-    #[test]
-    fn timestamptz_binary() {
-        let day_usecs: i64 = 8780 * USECS_PER_DAY;
-        let time_usecs: i64 = (10 * 3600 + 30 * 60 + 45) * USECS_PER_SEC;
-        let total_usecs = day_usecs + time_usecs;
-        let bytes = total_usecs.to_be_bytes();
-        let ts = Timestamp::from_binary(oid::TIMESTAMPTZ, &bytes)
-            .unwrap()
-            .to_zoned_datetime(TimeZone::UTC);
-        assert_eq!(ts.year(), 2024);
-        assert_eq!(ts.month(), 1);
-        assert_eq!(ts.day(), 15);
-        assert_eq!(ts.hour(), 10);
-        assert_eq!(ts.minute(), 30);
-        assert_eq!(ts.second(), 45);
+    fn from_binary(oid: Oid, bytes: &[u8]) -> Result<Self> {
+        if oid != oid::TIMESTAMPTZ {
+            return Err(Error::Decode(format!(
+                "cannot decode oid {} as ZonedDateTime",
+                oid
+            )));
+        }
+        Timestamp::from_binary(oid, bytes)
+            .map(|timestamp| timestamp.to_zoned_datetime(TimeZone::UTC))
+    }
+}
+
+impl ToWireValue for ZonedDateTime {
+    const NATURAL_OID: Oid = oid::TIMESTAMPTZ;
+
+    fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
+        match target_oid {
+            oid::TIMESTAMPTZ => {
+                let timestamp = self.timestamp();
+                if timestamp.subsec_nanosecond() % 1000 != 0 {
+                    return Err(Error::Encode(
+                        "ZonedDateTime has sub-microsecond precision".into(),
+                    ));
+                }
+                let usecs = timestamp.duration_since(PG_EPOCH_TS).as_micros() as i64;
+                buf.extend_from_slice(&8_i32.to_be_bytes());
+                buf.extend_from_slice(&usecs.to_be_bytes());
+                Ok(())
+            }
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
+        }
+    }
+}
+
+fn span_from_interval(interval: Interval) -> Result<Span> {
+    let signs = [
+        i64::from(interval.months).signum(),
+        i64::from(interval.days).signum(),
+        interval.microseconds.signum(),
+    ];
+    if signs.contains(&1) && signs.contains(&-1) {
+        return Err(Error::Decode(
+            "interval with mixed signs cannot be decoded as Span; decode as Interval instead"
+                .into(),
+        ));
+    }
+    Span::new()
+        .try_months(interval.months)
+        .and_then(|span| span.try_days(interval.days))
+        .and_then(|span| span.try_microseconds(interval.microseconds))
+        .map_err(|e| {
+            Error::Decode(format!(
+                "interval out of range for Span: {}; decode as Interval instead",
+                e
+            ))
+        })
+}
+
+impl FromWireValue<'_> for Span {
+    fn from_text(oid: Oid, _bytes: &[u8]) -> Result<Self> {
+        if oid != oid::INTERVAL {
+            return Err(Error::Decode(format!("cannot decode oid {} as Span", oid)));
+        }
+        Err(Error::Decode(INTERVAL_TEXT_UNSUPPORTED.into()))
     }
 
-    #[test]
-    fn timestamptz_roundtrip() {
-        let original = Timestamp::from_microsecond(1_795_000_000_123_456).unwrap();
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        let decoded = Timestamp::from_binary(oid::TIMESTAMPTZ, &buf[4..]).unwrap();
-        assert_eq!(original, decoded);
+    fn from_binary(oid: Oid, bytes: &[u8]) -> Result<Self> {
+        if oid != oid::INTERVAL {
+            return Err(Error::Decode(format!("cannot decode oid {} as Span", oid)));
+        }
+        span_from_interval(Interval::from_binary(oid, bytes)?)
+    }
+}
+
+impl ToWireValue for Span {
+    const NATURAL_OID: Oid = oid::INTERVAL;
+
+    fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
+        match target_oid {
+            oid::INTERVAL => {
+                let months = i64::from(self.get_years()) * 12 + i64::from(self.get_months());
+                let days = i64::from(self.get_weeks()) * 7 + i64::from(self.get_days());
+                let nanos = i128::from(self.get_hours()) * 3_600_000_000_000
+                    + i128::from(self.get_minutes()) * 60_000_000_000
+                    + i128::from(self.get_seconds()) * 1_000_000_000
+                    + i128::from(self.get_milliseconds()) * 1_000_000
+                    + i128::from(self.get_microseconds()) * 1_000
+                    + i128::from(self.get_nanoseconds());
+                Interval::from_nanos(months, days, nanos)?.encode(target_oid, buf)
+            }
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
+        }
+    }
+}
+
+fn signed_duration_from_interval(interval: Interval) -> Result<SignedDuration> {
+    interval
+        .microseconds_only("SignedDuration")
+        .map(SignedDuration::from_micros)
+}
+
+impl FromWireValue<'_> for SignedDuration {
+    fn from_text(oid: Oid, _bytes: &[u8]) -> Result<Self> {
+        if oid != oid::INTERVAL {
+            return Err(Error::Decode(format!(
+                "cannot decode oid {} as SignedDuration",
+                oid
+            )));
+        }
+        Err(Error::Decode(INTERVAL_TEXT_UNSUPPORTED.into()))
+    }
+
+    fn from_binary(oid: Oid, bytes: &[u8]) -> Result<Self> {
+        if oid != oid::INTERVAL {
+            return Err(Error::Decode(format!(
+                "cannot decode oid {} as SignedDuration",
+                oid
+            )));
+        }
+        signed_duration_from_interval(Interval::from_binary(oid, bytes)?)
+    }
+}
+
+impl ToWireValue for SignedDuration {
+    const NATURAL_OID: Oid = oid::INTERVAL;
+
+    fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
+        match target_oid {
+            oid::INTERVAL => Interval::from_nanos(0, 0, self.as_nanos())?.encode(target_oid, buf),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
+        }
     }
 }

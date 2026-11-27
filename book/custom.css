@@ -2,6 +2,10 @@
     margin-block-start: 1.5em;
 }
 
+table :not(pre) > code.hljs {
+    background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+
 :root:has(main > h1#type-system),
 :root:has(main > h1#pg_type) {
     --content-max-width: none;

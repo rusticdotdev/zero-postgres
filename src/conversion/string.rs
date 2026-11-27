@@ -1,16 +1,30 @@
 //! String type implementations (&str, String).
 
+#[cfg(test)]
+#[path = "string_tests.rs"]
+mod tests;
+
 use crate::error::{Error, Result};
 use crate::protocol::types::{Oid, oid};
 
 use super::{FromWireValue, ToWireValue};
+
+const JSONB_VERSION: u8 = 1;
+const JSONPATH_VERSION: u8 = 1;
 
 impl<'a> FromWireValue<'a> for &'a str {
     fn from_text(oid: Oid, bytes: &'a [u8]) -> Result<Self> {
         // NUMERIC uses text format, so it can be decoded as str in text mode
         if !matches!(
             oid,
-            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::NUMERIC
+            oid::TEXT
+                | oid::VARCHAR
+                | oid::BPCHAR
+                | oid::NAME
+                | oid::JSON
+                | oid::JSONB
+                | oid::JSONPATH
+                | oid::NUMERIC
         ) {
             return Err(Error::Decode(format!("cannot decode oid {} as str", oid)));
         }
@@ -19,8 +33,24 @@ impl<'a> FromWireValue<'a> for &'a str {
     }
 
     fn from_binary(oid: Oid, bytes: &'a [u8]) -> Result<Self> {
+        match (oid, bytes.split_first()) {
+            (oid::JSONB, Some((&JSONB_VERSION, text)))
+            | (oid::JSONPATH, Some((&JSONPATH_VERSION, text))) => {
+                return Self::from_binary(oid::TEXT, text);
+            }
+            (oid::JSONB | oid::JSONPATH, _) => {
+                return Err(Error::Decode(format!(
+                    "unsupported binary version for oid {}",
+                    oid
+                )));
+            }
+            _ => {}
+        }
         // Note: NUMERIC binary format is NOT UTF-8, so we don't accept it here
-        if !matches!(oid, oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME) {
+        if !matches!(
+            oid,
+            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::JSON
+        ) {
             return Err(Error::Decode(format!("cannot decode oid {} as str", oid)));
         }
         simdutf8::compat::from_utf8(bytes)
@@ -33,7 +63,14 @@ impl FromWireValue<'_> for String {
         // NUMERIC uses text format, so it can be decoded as String in text mode
         if !matches!(
             oid,
-            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::NUMERIC
+            oid::TEXT
+                | oid::VARCHAR
+                | oid::BPCHAR
+                | oid::NAME
+                | oid::JSON
+                | oid::JSONB
+                | oid::JSONPATH
+                | oid::NUMERIC
         ) {
             return Err(Error::Decode(format!(
                 "cannot decode oid {} as String",
@@ -46,8 +83,24 @@ impl FromWireValue<'_> for String {
     }
 
     fn from_binary(oid: Oid, bytes: &[u8]) -> Result<Self> {
+        match (oid, bytes.split_first()) {
+            (oid::JSONB, Some((&JSONB_VERSION, text)))
+            | (oid::JSONPATH, Some((&JSONPATH_VERSION, text))) => {
+                return Self::from_binary(oid::TEXT, text);
+            }
+            (oid::JSONB | oid::JSONPATH, _) => {
+                return Err(Error::Decode(format!(
+                    "unsupported binary version for oid {}",
+                    oid
+                )));
+            }
+            _ => {}
+        }
         // Note: NUMERIC binary format is NOT UTF-8, so we don't accept it here
-        if !matches!(oid, oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME) {
+        if !matches!(
+            oid,
+            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::JSON
+        ) {
             return Err(Error::Decode(format!(
                 "cannot decode oid {} as String",
                 oid
@@ -60,9 +113,7 @@ impl FromWireValue<'_> for String {
 }
 
 impl ToWireValue for str {
-    fn natural_oid(&self) -> Oid {
-        oid::TEXT
-    }
+    const NATURAL_OID: Oid = oid::TEXT;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
@@ -72,55 +123,25 @@ impl ToWireValue for str {
                 buf.extend_from_slice(bytes);
                 Ok(())
             }
-            oid::JSONB => {
-                // Binary JSONB is a version byte (currently 1) followed by the JSON text.
-                let bytes = self.as_bytes();
-                buf.extend_from_slice(&((bytes.len() + 1) as i32).to_be_bytes());
-                buf.push(1);
-                buf.extend_from_slice(bytes);
-                Ok(())
-            }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            oid::JSONB => encode_with_version(JSONB_VERSION, self, buf),
+            oid::JSONPATH => encode_with_version(JSONPATH_VERSION, self, buf),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
 
 impl ToWireValue for String {
-    fn natural_oid(&self) -> Oid {
-        oid::TEXT
-    }
+    const NATURAL_OID: Oid = oid::TEXT;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         self.as_str().encode(target_oid, buf)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn string_text() {
-        assert_eq!(String::from_text(oid::TEXT, b"hello").unwrap(), "hello");
-    }
-
-    #[test]
-    fn type_mismatch() {
-        // Trying to decode INT4 as String should fail
-        String::from_binary(oid::INT4, &[0, 0, 0, 1]).unwrap_err();
-    }
-
-    #[test]
-    fn encode_jsonb_prefixes_version() {
-        let mut buf = Vec::new();
-        "{}".encode(oid::JSONB, &mut buf).unwrap();
-        assert_eq!(buf, [0, 0, 0, 3, 1, b'{', b'}']);
-    }
-
-    #[test]
-    fn encode_json_has_no_version() {
-        let mut buf = Vec::new();
-        "{}".encode(oid::JSON, &mut buf).unwrap();
-        assert_eq!(buf, [0, 0, 0, 2, b'{', b'}']);
-    }
+fn encode_with_version(version: u8, text: &str, buf: &mut Vec<u8>) -> Result<()> {
+    let bytes = text.as_bytes();
+    buf.extend_from_slice(&((bytes.len() + 1) as i32).to_be_bytes());
+    buf.push(version);
+    buf.extend_from_slice(bytes);
+    Ok(())
 }

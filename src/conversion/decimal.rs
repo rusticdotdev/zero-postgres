@@ -128,9 +128,7 @@ impl FromWireValue<'_> for Decimal {
 }
 
 impl ToWireValue for Decimal {
-    fn natural_oid(&self) -> Oid {
-        oid::NUMERIC
-    }
+    const NATURAL_OID: Oid = oid::NUMERIC;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
@@ -140,7 +138,7 @@ impl ToWireValue for Decimal {
                 buf.extend_from_slice(text.as_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
@@ -173,7 +171,7 @@ mod tests {
         // encode() now produces text format for NUMERIC
         let original = Decimal::from_str("12345.6789").unwrap();
         let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
+        original.encode(Decimal::NATURAL_OID, &mut buf).unwrap();
         // Skip 4-byte length prefix
         let text = std::str::from_utf8(&buf[4..]).unwrap();
         assert_eq!(text, "12345.6789");
@@ -183,7 +181,7 @@ mod tests {
     fn decimal_encode_zero() {
         let original = Decimal::ZERO;
         let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
+        original.encode(Decimal::NATURAL_OID, &mut buf).unwrap();
         let text = std::str::from_utf8(&buf[4..]).unwrap();
         assert_eq!(text, "0");
     }
@@ -192,7 +190,7 @@ mod tests {
     fn decimal_encode_negative() {
         let original = Decimal::from_str("-123.456").unwrap();
         let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
+        original.encode(Decimal::NATURAL_OID, &mut buf).unwrap();
         let text = std::str::from_utf8(&buf[4..]).unwrap();
         assert_eq!(text, "-123.456");
     }

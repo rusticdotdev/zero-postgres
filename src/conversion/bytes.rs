@@ -1,5 +1,9 @@
 //! Byte type implementations (`&[u8]`, `Vec<u8>`).
 
+#[cfg(test)]
+#[path = "bytes_tests.rs"]
+mod tests;
+
 use crate::error::{Error, Result};
 use crate::protocol::types::{Oid, oid};
 
@@ -10,9 +14,13 @@ impl<'a> FromWireValue<'a> for &'a [u8] {
         if oid != oid::BYTEA {
             return Err(Error::Decode(format!("cannot decode oid {} as bytes", oid)));
         }
-        // Text format for bytea is hex-encoded: \x followed by hex digits
-        // For simplicity, we just return the raw bytes (caller can decode if needed)
-        Ok(bytes)
+        match memchr::memchr(b'\\', bytes) {
+            None => Ok(bytes),
+            Some(0) if bytes == b"\\x" => Ok(&bytes[2..]),
+            Some(_) => Err(Error::Decode(
+                "cannot borrow bytea in text format as bytes; decode as Vec<u8>".into(),
+            )),
+        }
     }
 
     fn from_binary(oid: Oid, bytes: &'a [u8]) -> Result<Self> {
@@ -31,12 +39,10 @@ impl FromWireValue<'_> for Vec<u8> {
                 oid
             )));
         }
-        // Text format for bytea is hex-encoded: \xDEADBEEF
         if bytes.starts_with(b"\\x") {
             decode_hex(&bytes[2..])
         } else {
-            // Fallback: return raw bytes
-            Ok(bytes.to_vec())
+            decode_escape(bytes)
         }
     }
 
@@ -52,9 +58,7 @@ impl FromWireValue<'_> for Vec<u8> {
 }
 
 impl ToWireValue for [u8] {
-    fn natural_oid(&self) -> Oid {
-        oid::BYTEA
-    }
+    const NATURAL_OID: Oid = oid::BYTEA;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
@@ -63,15 +67,13 @@ impl ToWireValue for [u8] {
                 buf.extend_from_slice(self);
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
 
 impl ToWireValue for Vec<u8> {
-    fn natural_oid(&self) -> Oid {
-        oid::BYTEA
-    }
+    const NATURAL_OID: Oid = oid::BYTEA;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         self.as_slice().encode(target_oid, buf)
@@ -112,15 +114,28 @@ fn decode_hex(hex: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bytea_hex() {
-        assert_eq!(
-            Vec::<u8>::from_text(oid::BYTEA, b"\\xDEADBEEF").unwrap(),
-            vec![0xDE, 0xAD, 0xBE, 0xEF]
-        );
+fn decode_escape(text: &[u8]) -> Result<Vec<u8>> {
+    let mut result = Vec::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(position) = memchr::memchr(b'\\', rest) {
+        result.extend_from_slice(&rest[..position]);
+        match rest[position + 1..] {
+            [b'\\', ..] => {
+                result.push(b'\\');
+                rest = &rest[position + 2..];
+            }
+            [
+                high @ b'0'..=b'3',
+                middle @ b'0'..=b'7',
+                low @ b'0'..=b'7',
+                ..,
+            ] => {
+                result.push(((high - b'0') << 6) | ((middle - b'0') << 3) | (low - b'0'));
+                rest = &rest[position + 4..];
+            }
+            _ => return Err(Error::Decode("invalid bytea escape".into())),
+        }
     }
+    result.extend_from_slice(rest);
+    Ok(result)
 }

@@ -24,9 +24,7 @@ impl FromWireValue<'_> for uuid::Uuid {
 }
 
 impl ToWireValue for uuid::Uuid {
-    fn natural_oid(&self) -> Oid {
-        oid::UUID
-    }
+    const NATURAL_OID: Oid = oid::UUID;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
@@ -35,7 +33,7 @@ impl ToWireValue for uuid::Uuid {
                 buf.extend_from_slice(self.as_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
@@ -65,7 +63,7 @@ mod tests {
     fn uuid_roundtrip() {
         let original = uuid::Uuid::parse_str("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11").unwrap();
         let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
+        original.encode(uuid::Uuid::NATURAL_OID, &mut buf).unwrap();
         // Skip the 4-byte length prefix
         let decoded = uuid::Uuid::from_binary(oid::UUID, &buf[4..]).unwrap();
         assert_eq!(original, decoded);

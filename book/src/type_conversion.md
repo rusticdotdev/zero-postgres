@@ -1,19 +1,19 @@
 # Type Conversion
 
-## Numeric, Boolean
+## Number
 
 | Rust (Input) | PostgreSQL | Rust (Output) |
 |---|---|---|
-| `bool` | `bool` (`BOOLEAN`) | `bool` |
-| `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` | `int2` (`SMALLINT`) | `i16`, `i32`, `i64` |
-| `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` | `int4` (`INTEGER`) | `i32`, `i64` |
-| `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` | `int8` (`BIGINT`) | `i64` |
-| `f32`, `f64` | `float4` (`REAL`) | `f32`, `f64` |
-| `f32`, `f64` | `float8` (`DOUBLE PRECISION`) | `f64` |
+| `bool` | `bool` (`BOOLEAN`) | same as input |
+| `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` | `int2` (`SMALLINT`) | `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64` |
+| `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` | `int4` (`INTEGER`) | `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64` |
+| `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` | `int8` (`BIGINT`) | `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64` |
+| `f32`, `f64`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` | `float4` (`REAL`) | `f32`, `f64` |
+| `f32`, `f64`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` | `float8` (`DOUBLE PRECISION`) | `f64` |
 | `f32`, `f64`, `rust_decimal::Decimal` | `numeric` (`DECIMAL`) | `f32`, `f64`, `&str`, `String`, `rust_decimal::Decimal` |
 |  | `money` |  |
 
-## Character, Binary
+## String
 
 | Rust (Input) | PostgreSQL | Rust (Output) |
 |---|---|---|
@@ -21,28 +21,28 @@
 | `str`, `String` | `varchar` (`CHARACTER VARYING`) | `&str`, `String` |
 | `str`, `String` | `bpchar` (`CHARACTER`) | `&str`, `String` |
 | `str`, `String` | `name` | `&str`, `String` |
-|  | `char` |  |
+| `i8`, `u8` | `char` | same as input |
 | `[u8]`, `Vec<u8>` | `bytea` | `&[u8]`, `Vec<u8>` |
 
-## Date/Time
+## Date, Time
 
 | Rust (Input) | PostgreSQL | Rust (Output) |
 |---|---|---|
-| `jiff::civil::Date`, `time::Date` | `date` | `jiff::civil::Date`, `time::Date` |
-| `jiff::civil::Time`, `time::Time` | `time` (`TIME WITHOUT TIME ZONE`) | `jiff::civil::Time`, `time::Time` |
+| `jiff::civil::Date`, `time::Date` | `date` | same as input |
+| `jiff::civil::Time`, `time::Time` | `time` (`TIME WITHOUT TIME ZONE`) | same as input |
 |  | `timetz` (`TIME WITH TIME ZONE`) |  |
 | `jiff::civil::DateTime`, `jiff::Timestamp`, `time::PrimitiveDateTime`, `time::OffsetDateTime` | `timestamp` (`TIMESTAMP WITHOUT TIME ZONE`) | `jiff::civil::DateTime`, `time::PrimitiveDateTime` |
-| `jiff::civil::DateTime`, `jiff::Timestamp`, `jiff::ZonedDateTime`, `time::PrimitiveDateTime`, `time::OffsetDateTime` | `timestamptz` (`TIMESTAMP WITH TIME ZONE`) | `jiff::civil::DateTime`, `jiff::Timestamp`, `jiff::ZonedDateTime`, `time::PrimitiveDateTime`, `time::OffsetDateTime` |
-| `jiff::Span`, `jiff::SignedDuration`, `time::SignedDuration` | `interval` | `jiff::Span`, `jiff::SignedDuration`, `time::SignedDuration` |
+| `std::time::SystemTime`, `jiff::civil::DateTime`, `jiff::Timestamp`, `jiff::ZonedDateTime`, `time::PrimitiveDateTime`, `time::OffsetDateTime` | `timestamptz` (`TIMESTAMP WITH TIME ZONE`) | same as input |
+| `Interval`, `std::time::Duration`, `jiff::Span`, `jiff::SignedDuration`, `time::SignedDuration` | `interval` | same as input |
 
 ## UUID, JSON, XML
 
 | Rust (Input) | PostgreSQL | Rust (Output) |
 |---|---|---|
-| `uuid::Uuid` | `uuid` | `uuid::Uuid` |
-| `str`, `String` | `json` |  |
-| `str`, `String` | `jsonb` |  |
-|  | `jsonpath` |  |
+| `uuid::Uuid` | `uuid` | same as input |
+| `str`, `String` | `json` | `&str`, `String` |
+| `str`, `String` | `jsonb` | `&str`, `String` |
+| `str`, `String` | `jsonpath` | `&str`, `String` |
 |  | `xml` |  |
 
 ## Network, Bit String

@@ -1,5 +1,8 @@
 # Natural OID
 
+TODO: explain what natural oid is.
+
+
 | Rust | PG name (typname) | oid |
 |---|---|---|
 | `bool` | `bool` | `16` |
@@ -17,6 +20,7 @@
 | `String` | `text` | `25` |
 | `[u8]` | `bytea` | `17` |
 | `Vec<u8>` | `bytea` | `17` |
+| `Interval` | `interval` | `1186` |
 | `&T` | Same as `T` | |
 | `Option<T>` (`Some`) | Same as `T` | |
 | `Option<T>` (`None`) | | `0` |

@@ -3,14 +3,17 @@
 //! This module provides traits and implementations for converting between
 //! Rust types and PostgreSQL wire format values.
 
+mod bool;
 mod bytes;
+mod number;
 mod numeric_util;
-mod primitives;
 pub mod ref_row;
 mod row;
+mod std_time;
 mod string;
 
 pub use numeric_util::numeric_to_string;
+pub use std_time::Interval;
 
 #[cfg(feature = "with-rust-decimal")]
 mod decimal;
@@ -66,14 +69,14 @@ pub trait FromWireValue<'a>: Sized {
 /// - Int32 -1 for NULL
 ///
 /// The trait provides OID-aware encoding:
-/// - `natural_oid()` returns the OID this value naturally encodes to
+/// - `NATURAL_OID` is the OID this value naturally encodes to
 /// - `encode()` encodes the value for a specific target OID, using the
 ///   preferred format (text for NUMERIC, binary for everything else)
 pub trait ToWireValue {
     /// The OID this value naturally encodes to.
     ///
     /// For example, i64 naturally encodes to INT8 (OID 20).
-    fn natural_oid(&self) -> Oid;
+    const NATURAL_OID: Oid;
 
     /// Encode this value for the given target OID.
     ///
@@ -124,12 +127,7 @@ impl<'a, T: FromWireValue<'a>> FromWireValue<'a> for Option<T> {
 }
 
 impl<T: ToWireValue> ToWireValue for Option<T> {
-    fn natural_oid(&self) -> Oid {
-        match self {
-            Some(v) => v.natural_oid(),
-            None => 0, // Unknown/NULL
-        }
-    }
+    const NATURAL_OID: Oid = T::NATURAL_OID;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match self {
@@ -146,9 +144,7 @@ impl<T: ToWireValue> ToWireValue for Option<T> {
 // === Reference support ===
 
 impl<T: ToWireValue + ?Sized> ToWireValue for &T {
-    fn natural_oid(&self) -> Oid {
-        (*self).natural_oid()
-    }
+    const NATURAL_OID: Oid = T::NATURAL_OID;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         (*self).encode(target_oid, buf)
@@ -191,7 +187,7 @@ impl<T: ToWireValue> ToParams for [T] {
     }
 
     fn natural_oids(&self) -> Vec<Oid> {
-        self.iter().map(|v| v.natural_oid()).collect()
+        vec![T::NATURAL_OID; self.len()]
     }
 
     fn encode(&self, target_oids: &[Oid], buf: &mut Vec<u8>) -> Result<()> {
@@ -225,7 +221,7 @@ macro_rules! impl_to_params {
             }
 
             fn natural_oids(&self) -> Vec<Oid> {
-                vec![$(self.$idx.natural_oid()),+]
+                vec![$($T::NATURAL_OID),+]
             }
 
             fn encode(&self, target_oids: &[Oid], buf: &mut Vec<u8>) -> Result<()> {
@@ -261,6 +257,12 @@ mod tests {
     #[test]
     fn option_null() {
         assert_eq!(Option::<i32>::from_null().unwrap(), None);
+    }
+
+    #[test]
+    fn option_natural_oid() {
+        assert_eq!((None::<i32>,).natural_oids(), vec![oid::INT4]);
+        assert_eq!((Some(1_i32),).natural_oids(), vec![oid::INT4]);
     }
 
     #[test]

@@ -1,8 +1,13 @@
 //! Time crate type implementations (Date, Time, PrimitiveDateTime, OffsetDateTime).
 
+#[cfg(test)]
+#[path = "time_tests.rs"]
+mod tests;
+
 use crate::error::{Error, Result};
 use crate::protocol::types::{Oid, oid};
 
+use super::std_time::{INTERVAL_TEXT_UNSUPPORTED, Interval};
 use super::{FromWireValue, PG_EPOCH_JULIAN_DAY, ToWireValue};
 
 impl FromWireValue<'_> for time::Date {
@@ -33,9 +38,7 @@ impl FromWireValue<'_> for time::Date {
 }
 
 impl ToWireValue for time::Date {
-    fn natural_oid(&self) -> Oid {
-        oid::DATE
-    }
+    const NATURAL_OID: Oid = oid::DATE;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
@@ -45,7 +48,7 @@ impl ToWireValue for time::Date {
                 buf.extend_from_slice(&pg_days.to_be_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
@@ -86,13 +89,14 @@ impl FromWireValue<'_> for time::Time {
 }
 
 impl ToWireValue for time::Time {
-    fn natural_oid(&self) -> Oid {
-        oid::TIME
-    }
+    const NATURAL_OID: Oid = oid::TIME;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
             oid::TIME => {
+                if !self.nanosecond().is_multiple_of(1000) {
+                    return Err(Error::Encode("Time has sub-microsecond precision".into()));
+                }
                 let (hour, minute, second, nano) = self.as_hms_nano();
                 let usecs = (hour as i64) * 3_600_000_000
                     + (minute as i64) * 60_000_000
@@ -102,7 +106,7 @@ impl ToWireValue for time::Time {
                 buf.extend_from_slice(&usecs.to_be_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
@@ -153,13 +157,16 @@ impl FromWireValue<'_> for time::PrimitiveDateTime {
 }
 
 impl ToWireValue for time::PrimitiveDateTime {
-    fn natural_oid(&self) -> Oid {
-        oid::TIMESTAMP
-    }
+    const NATURAL_OID: Oid = oid::TIMESTAMP;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
             oid::TIMESTAMP | oid::TIMESTAMPTZ => {
+                if !self.nanosecond().is_multiple_of(1000) {
+                    return Err(Error::Encode(
+                        "PrimitiveDateTime has sub-microsecond precision".into(),
+                    ));
+                }
                 // Calculate microseconds since PostgreSQL epoch (2000-01-01 00:00:00)
                 const PG_EPOCH: time::PrimitiveDateTime =
                     time::macros::datetime!(2000-01-01 00:00:00);
@@ -169,7 +176,7 @@ impl ToWireValue for time::PrimitiveDateTime {
                 buf.extend_from_slice(&usecs.to_be_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
@@ -222,13 +229,16 @@ impl FromWireValue<'_> for time::OffsetDateTime {
 }
 
 impl ToWireValue for time::OffsetDateTime {
-    fn natural_oid(&self) -> Oid {
-        oid::TIMESTAMPTZ
-    }
+    const NATURAL_OID: Oid = oid::TIMESTAMPTZ;
 
     fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
         match target_oid {
             oid::TIMESTAMP | oid::TIMESTAMPTZ => {
+                if !self.nanosecond().is_multiple_of(1000) {
+                    return Err(Error::Encode(
+                        "OffsetDateTime has sub-microsecond precision".into(),
+                    ));
+                }
                 // Convert to UTC and calculate microseconds since PostgreSQL epoch
                 let utc = self.to_offset(time::UtcOffset::UTC);
                 const PG_EPOCH: time::OffsetDateTime =
@@ -239,153 +249,48 @@ impl ToWireValue for time::OffsetDateTime {
                 buf.extend_from_slice(&usecs.to_be_bytes());
                 Ok(())
             }
-            _ => Err(Error::type_mismatch(self.natural_oid(), target_oid)),
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn signed_duration_from_interval(interval: Interval) -> Result<time::SignedDuration> {
+    interval
+        .microseconds_only("SignedDuration")
+        .map(time::SignedDuration::microseconds)
+}
 
-    #[test]
-    fn date_text() {
-        let date = time::Date::from_text(oid::DATE, b"2024-01-15").unwrap();
-        assert_eq!(date.year(), 2024);
-        assert_eq!(date.month() as u8, 1);
-        assert_eq!(date.day(), 15);
+impl FromWireValue<'_> for time::SignedDuration {
+    fn from_text(oid: Oid, _bytes: &[u8]) -> Result<Self> {
+        if oid != oid::INTERVAL {
+            return Err(Error::Decode(format!(
+                "cannot decode oid {} as SignedDuration",
+                oid
+            )));
+        }
+        Err(Error::Decode(INTERVAL_TEXT_UNSUPPORTED.into()))
     }
 
-    #[test]
-    fn date_binary() {
-        // 2024-01-15 is 8780 days since 2000-01-01
-        let days: i32 = 8780;
-        let bytes = days.to_be_bytes();
-        let date = time::Date::from_binary(oid::DATE, &bytes).unwrap();
-        assert_eq!(date.year(), 2024);
-        assert_eq!(date.month() as u8, 1);
-        assert_eq!(date.day(), 15);
+    fn from_binary(oid: Oid, bytes: &[u8]) -> Result<Self> {
+        if oid != oid::INTERVAL {
+            return Err(Error::Decode(format!(
+                "cannot decode oid {} as SignedDuration",
+                oid
+            )));
+        }
+        signed_duration_from_interval(Interval::from_binary(oid, bytes)?)
     }
+}
 
-    #[test]
-    fn date_binary_infinity() {
-        time::Date::from_binary(oid::DATE, &i32::MAX.to_be_bytes()).unwrap_err();
-        time::Date::from_binary(oid::DATE, &i32::MIN.to_be_bytes()).unwrap_err();
-    }
+impl ToWireValue for time::SignedDuration {
+    const NATURAL_OID: Oid = oid::INTERVAL;
 
-    #[test]
-    fn date_roundtrip() {
-        let original = time::Date::from_calendar_date(2024, time::Month::January, 15).unwrap();
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        let decoded = time::Date::from_binary(oid::DATE, &buf[4..]).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn time_text() {
-        let time = time::Time::from_text(oid::TIME, b"10:30:45").unwrap();
-        assert_eq!(time.hour(), 10);
-        assert_eq!(time.minute(), 30);
-        assert_eq!(time.second(), 45);
-    }
-
-    #[test]
-    fn time_text_with_micros() {
-        let time = time::Time::from_text(oid::TIME, b"10:30:45.123456").unwrap();
-        assert_eq!(time.hour(), 10);
-        assert_eq!(time.minute(), 30);
-        assert_eq!(time.second(), 45);
-        assert_eq!(time.microsecond(), 123456);
-    }
-
-    #[test]
-    fn time_binary() {
-        // 10:30:45 = (10*3600 + 30*60 + 45) * 1_000_000 microseconds
-        let usecs: i64 = (10 * 3600 + 30 * 60 + 45) * 1_000_000;
-        let bytes = usecs.to_be_bytes();
-        let time = time::Time::from_binary(oid::TIME, &bytes).unwrap();
-        assert_eq!(time.hour(), 10);
-        assert_eq!(time.minute(), 30);
-        assert_eq!(time.second(), 45);
-    }
-
-    #[test]
-    fn time_roundtrip() {
-        let original = time::Time::from_hms_micro(10, 30, 45, 123456).unwrap();
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        let decoded = time::Time::from_binary(oid::TIME, &buf[4..]).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn timestamp_text() {
-        let ts =
-            time::PrimitiveDateTime::from_text(oid::TIMESTAMP, b"2024-01-15 10:30:45").unwrap();
-        assert_eq!(ts.year(), 2024);
-        assert_eq!(ts.month() as u8, 1);
-        assert_eq!(ts.day(), 15);
-        assert_eq!(ts.hour(), 10);
-        assert_eq!(ts.minute(), 30);
-        assert_eq!(ts.second(), 45);
-    }
-
-    #[test]
-    fn timestamp_binary() {
-        // 2024-01-15 10:30:45 UTC
-        // Days since 2000-01-01: 8780
-        // Time: 10:30:45 = 37845 seconds = 37845000000 microseconds
-        let day_usecs: i64 = 8780 * 24 * 3600 * 1_000_000;
-        let time_usecs: i64 = (10 * 3600 + 30 * 60 + 45) * 1_000_000;
-        let total_usecs = day_usecs + time_usecs;
-        let bytes = total_usecs.to_be_bytes();
-        let ts = time::PrimitiveDateTime::from_binary(oid::TIMESTAMP, &bytes).unwrap();
-        assert_eq!(ts.year(), 2024);
-        assert_eq!(ts.month() as u8, 1);
-        assert_eq!(ts.day(), 15);
-        assert_eq!(ts.hour(), 10);
-        assert_eq!(ts.minute(), 30);
-        assert_eq!(ts.second(), 45);
-    }
-
-    #[test]
-    fn timestamp_roundtrip() {
-        let date = time::Date::from_calendar_date(2024, time::Month::January, 15).unwrap();
-        let time = time::Time::from_hms_micro(10, 30, 45, 123456).unwrap();
-        let original = time::PrimitiveDateTime::new(date, time);
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        let decoded = time::PrimitiveDateTime::from_binary(oid::TIMESTAMP, &buf[4..]).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn timestamptz_binary() {
-        // Same as timestamp but with timezone
-        let day_usecs: i64 = 8780 * 24 * 3600 * 1_000_000;
-        let time_usecs: i64 = (10 * 3600 + 30 * 60 + 45) * 1_000_000;
-        let total_usecs = day_usecs + time_usecs;
-        let bytes = total_usecs.to_be_bytes();
-        let ts = time::OffsetDateTime::from_binary(oid::TIMESTAMPTZ, &bytes).unwrap();
-        assert_eq!(ts.year(), 2024);
-        assert_eq!(ts.month() as u8, 1);
-        assert_eq!(ts.day(), 15);
-        assert_eq!(ts.hour(), 10);
-        assert_eq!(ts.minute(), 30);
-        assert_eq!(ts.second(), 45);
-    }
-
-    #[test]
-    fn timestamptz_roundtrip() {
-        let original = time::OffsetDateTime::now_utc();
-        // Truncate to microseconds (PostgreSQL precision)
-        let original = original
-            .replace_nanosecond((original.nanosecond() / 1000) * 1000)
-            .unwrap();
-        let mut buf = Vec::new();
-        original.encode(original.natural_oid(), &mut buf).unwrap();
-        let decoded = time::OffsetDateTime::from_binary(oid::TIMESTAMPTZ, &buf[4..]).unwrap();
-        assert_eq!(original, decoded);
+    fn encode(&self, target_oid: Oid, buf: &mut Vec<u8>) -> Result<()> {
+        match target_oid {
+            oid::INTERVAL => {
+                Interval::from_nanos(0, 0, self.whole_nanoseconds())?.encode(target_oid, buf)
+            }
+            _ => Err(Error::type_mismatch(Self::NATURAL_OID, target_oid)),
+        }
     }
 }
