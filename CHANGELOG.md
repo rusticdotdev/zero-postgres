@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.12.0](https://github.com/rusticdotdev/zero-postgres/compare/v0.11.0...v0.12.0) - 2026-11-27
+
+### <!-- 0 -->New features
+- add range type conversions
+- add macaddr, macaddr8, inet and cidr conversions
+- [**breaking**] add ReportedParameters and update it on ParameterStatus
+- [**breaking**] extend type conversions and reject lossy ones
+
+### <!-- 3 -->Documentation
+- add plans for type conversion
+- document the auth-gss feature flag
+
 ## [v0.11.0](https://github.com/rusticdotdev/zero-postgres/compare/v0.10.0...v0.11.0) - 2026-11-26
 
 ### Summary
