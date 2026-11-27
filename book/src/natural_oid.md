@@ -21,6 +21,9 @@ TODO: explain what natural oid is.
 | `[u8]` | `bytea` | `17` |
 | `Vec<u8>` | `bytea` | `17` |
 | `Interval` | `interval` | `1186` |
+| `[u8; 6]` | `macaddr` | `829` |
+| `[u8; 8]` | `macaddr8` | `774` |
+| `(std::net::IpAddr, u8)` | `inet` | `869` |
 | `&T` | Same as `T` | |
 | `Option<T>` (`Some`) | Same as `T` | |
 | `Option<T>` (`None`) | | `0` |
@@ -28,6 +31,19 @@ TODO: explain what natural oid is.
 | `[T]` **(TODO)** | `typarray` of `T` | |
 | `Vec<T>` **(TODO)** | `typarray` of `T` | |
 | `[T; N]` **(TODO)** | `typarray` of `T` | |
+
+### Range
+
+`PgRange<T>`, `Range<T>`, `RangeInclusive<T>`, `RangeFrom<T>`, `RangeTo<T>`, `RangeToInclusive<T>`
+
+| Natural type of `T` | PG name (typname) | oid |
+|---|---|---|
+| `int2`, `int4` | `int4range` | `3904` |
+| `int8` | `int8range` | `3926` |
+| `date` | `daterange` | `3912` |
+| `timestamp` | `tsrange` | `3908` |
+| `timestamptz` | `tstzrange` | `3910` |
+| other | compile error | |
 
 ### `with-jiff` (`jiff` crate)
 

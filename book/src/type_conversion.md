@@ -49,10 +49,10 @@
 
 | Rust (Input) | PostgreSQL | Rust (Output) |
 |---|---|---|
-|  | `inet` |  |
-|  | `cidr` |  |
-|  | `macaddr` |  |
-|  | `macaddr8` |  |
+| `(std::net::IpAddr, u8)` | `inet` | same as input |
+| `(std::net::IpAddr, u8)` | `cidr` | same as input |
+| `[u8; 6]` | `macaddr` | same as input |
+| `[u8; 8]` | `macaddr8` | same as input |
 |  | `bit` |  |
 |  | `varbit` (`BIT VARYING`) |  |
 
@@ -78,14 +78,16 @@
 
 ## Range, Multirange
 
+`T` is a Rust type listed for the element type: `int4` for `int4range`, `int8` for `int8range`, `timestamp` for `tsrange`, `timestamptz` for `tstzrange`, `date` for `daterange`.
+
 | Rust (Input) | PostgreSQL | Rust (Output) |
 |---|---|---|
-|  | `int4range` |  |
-|  | `int8range` |  |
+| `PgRange<T>`, `Range<T>`, `RangeInclusive<T>`, `RangeFrom<T>`, `RangeTo<T>`, `RangeToInclusive<T>` | `int4range` | same as input |
+| `PgRange<T>`, `Range<T>`, `RangeInclusive<T>`, `RangeFrom<T>`, `RangeTo<T>`, `RangeToInclusive<T>` | `int8range` | same as input |
 |  | `numrange` |  |
-|  | `tsrange` |  |
-|  | `tstzrange` |  |
-|  | `daterange` |  |
+| `PgRange<T>`, `Range<T>`, `RangeInclusive<T>`, `RangeFrom<T>`, `RangeTo<T>`, `RangeToInclusive<T>` | `tsrange` | same as input |
+| `PgRange<T>`, `Range<T>`, `RangeInclusive<T>`, `RangeFrom<T>`, `RangeTo<T>`, `RangeToInclusive<T>` | `tstzrange` | same as input |
+| `PgRange<T>`, `Range<T>`, `RangeInclusive<T>`, `RangeFrom<T>`, `RangeTo<T>`, `RangeToInclusive<T>` | `daterange` | same as input |
 |  | `int4multirange` |  |
 |  | `int8multirange` |  |
 |  | `nummultirange` |  |
